@@ -111,10 +111,10 @@ Key implementation pieces include:
 
 Core contributors are listed in contribution order:
 
-Yi Yang<sup>*</sup>, Huaihang Zheng<sup>*</sup>, Kai Ma<sup>*†</sup>, Tian Xie, Guozheng Li, Shenglin Xu,
-Xiangyu Wang, Yiren Ma, Baoxu Liu<sup>†</sup>
+Yi Yang<sup>&#42;</sup>, Huaihang Zheng<sup>&#42;</sup>, Kai Ma<sup>&#42;&#8224;</sup>, Tian Xie, Guozheng Li, Shenglin Xu,
+Xiangyu Wang, Yiren Ma, Baoxu Liu<sup>&#8224;</sup>
 
-<sub>* Equal contribution. † Project lead.</sub>
+<sub>&#42; Equal contribution. &#8224; Project lead.</sub>
 
 ## Citation
 
