@@ -1,0 +1,58 @@
+[project]
+name = "groot-rlt"
+version = "0.1.0"
+description = "GR00T-compatible RL Token representation, replay, and PyTorch learner"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy>=1.26.4,<2.0.0",
+    "torch>=2.7.1,<2.8",
+]
+
+[project.optional-dependencies]
+data = [
+    "pandas>=2.2.0,<3.0",
+    "pyarrow>=14.0.0",
+]
+groot = [
+    "matplotlib>=3.7.0",
+    "pandas>=2.2.0,<3.0",
+    "scikit-learn>=1.3.0",
+    "swanlab>=0.7.16",
+    "transformers>=4.57.3,<4.58",
+    "umap-learn>=0.5.0",
+]
+serve = [
+    "msgpack>=1.0.0",
+    "websockets>=14.2",
+]
+dev = [
+    "pytest>=8.3.4",
+]
+
+[project.scripts]
+groot-rlt-train-token = "groot_rlt.representation.train_vl_embedding_autoencoder:main"
+groot-rlt-evaluate-token = "groot_rlt.representation.evaluate_vl_embedding_autoencoder_ablation:main"
+groot-rlt-precompute = "groot_rlt.representation.precompute_rl_tokens_and_vla_actions:main"
+groot-rlt-visualize-token = "groot_rlt.representation.visualize_rl_token_umap:main"
+groot-rlt-serve-features = "groot_rlt.serving.groot_feature_server:main"
+groot-rlt-export-online-stats = "groot_rlt.integration.online_stats:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/groot_rlt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

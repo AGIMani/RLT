@@ -46,6 +46,7 @@ RLT-specific additions and modified entry points that make up openpi-RLT.
 | Remote policy serving | `scripts/serve_rlt_policy.py`, `packages/openpi-client/` | Serves frozen VLA references and compact RLT features to the online RL runtime. |
 | Deployment policy adapter | `src/openpi/policies/agilexbag_image_policy.py` | Adapts image observations and action chunks for deployment. |
 | Online RL runtime | `rlt_online_rl/src/rlt_online_rl/` | Contains actor, critic, learner, replay, inference, and rollout-side runtime modules. |
+| GR00T/Nero integration | `groot_rlt/` | Adds the Python 3.10 GR00T RL-token tools, strict PyTorch replay/learner, and a Machine-A compatible 26D feature server. |
 | Experiment launch and configs | `rlt_online_rl/launch/`, `rlt_online_rl/configs/` | Provides launch scripts and runtime configs for experiments such as Ethernet insertion. |
 | Robot interface bridge | `rlt_online_rl/train_deploy_alignment/` | Connects the online RL runtime with real-robot control and signal interfaces. |
 | Replay and analysis tools | `rlt_online_rl/scripts/` | Includes offline replay inspection, replay export, and experiment utilities. |
@@ -89,6 +90,31 @@ python scripts/serve_rlt_policy.py \
 For the real-robot online RL launch order, keyboard controls, replay semantics,
 and eval-only rollout flow, follow
 [rlt_online_rl/README.md](rlt_online_rl/README.md).
+
+## Isaac-GR00T / Nero Backend
+
+The `groot_rlt` project is isolated from the openpi environment because
+Isaac-GR00T uses Python 3.10 and a different Transformers version. Install it
+into the Isaac-GR00T virtual environment rather than running `uv sync` at this
+repository root:
+
+```bash
+cd /home/whf/Project/Isaac-GR00T
+uv pip install --python .venv/bin/python \
+  -e '/home/whf/Project/RLT/groot_rlt[groot,data,serve,dev]'
+```
+
+It provides:
+
+- GR00T/Cosmos VL embedding autoencoder training, evaluation, precompute, and UMAP tools;
+- the migrated provenance-rich PyTorch RLT schema/replay/trainer;
+- `groot-rlt-serve-features`, which emits `z_rl`, physical-space GR00T
+  reference chunks, and proprio using the existing Machine-A WebSocket contract;
+- configurable non-contiguous delta action channels and server-provided
+  proprio support for Nero's 26D state-as-action layout.
+
+See [`groot_rlt/README.md`](groot_rlt/README.md) for environment setup, CLI
+commands, normalization boundaries, and the 26D configuration example.
 
 ## Relationship to Upstream Work
 

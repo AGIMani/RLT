@@ -1,0 +1,423 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: Apache-2.0
+
+"""Export Nero LeRobot statistics for the online RLT action adapter.
+
+The Nero policy emits one absolute 26D action in this exact order::
+
+    eef_9d[9] + hand_joint_target[10] + arm_joint_target[7]
+
+The first 19 channels come from the LeRobot ``action`` statistics.  Nero's
+state-as-action arm channels come from ``observation.state[0:7]``, as declared
+by ``arm_joint_target.original_key`` in ``meta/modality.json``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import tempfile
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+SCHEMA_NAME = "rlt_online_action_stats"
+SCHEMA_VERSION = 2
+LAYOUT_NAME = "nero_right_l10_action"
+LAYOUT_VERSION = 1
+ACTION_DIM = 26
+
+CHANNEL_NAMES = (
+    "eef_9d.x",
+    "eef_9d.y",
+    "eef_9d.z",
+    "eef_9d.rot6d_0",
+    "eef_9d.rot6d_1",
+    "eef_9d.rot6d_2",
+    "eef_9d.rot6d_3",
+    "eef_9d.rot6d_4",
+    "eef_9d.rot6d_5",
+    "hand_joint_target.thumb_cmc_pitch",
+    "hand_joint_target.thumb_cmc_yaw",
+    "hand_joint_target.index_mcp_pitch",
+    "hand_joint_target.middle_mcp_pitch",
+    "hand_joint_target.ring_mcp_pitch",
+    "hand_joint_target.pinky_mcp_pitch",
+    "hand_joint_target.index_mcp_roll",
+    "hand_joint_target.ring_mcp_roll",
+    "hand_joint_target.pinky_mcp_roll",
+    "hand_joint_target.thumb_cmc_roll",
+    "arm_joint_target.0",
+    "arm_joint_target.1",
+    "arm_joint_target.2",
+    "arm_joint_target.3",
+    "arm_joint_target.4",
+    "arm_joint_target.5",
+    "arm_joint_target.6",
+)
+
+STAT_FIELDS = ("mean", "std", "min", "max", "q01", "q99")
+NORMALIZATION_MODES = ("quantile", "symmetric_quantile")
+
+
+@dataclass(frozen=True)
+class _GroupSpec:
+    name: str
+    action_start: int
+    action_end: int
+    source_key: str
+    source_start: int
+    source_end: int
+
+    @property
+    def dim(self) -> int:
+        return self.action_end - self.action_start
+
+
+_GROUP_SPECS = (
+    _GroupSpec("eef_9d", 0, 9, "action", 0, 9),
+    _GroupSpec("hand_joint_target", 9, 19, "action", 9, 19),
+    _GroupSpec("arm_joint_target", 19, 26, "observation.state", 0, 7),
+)
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def source_fingerprint(
+    stats_payload: Mapping[str, Any], modality_payload: Mapping[str, Any]
+) -> str:
+    """Return a deterministic semantic fingerprint of both source documents."""
+
+    return _sha256_bytes(
+        _canonical_json_bytes({"modality.json": modality_payload, "stats.json": stats_payload})
+    )
+
+
+def _require_mapping(value: Any, *, path: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a JSON object, got {type(value).__name__}")
+    return value
+
+
+def _require_int(value: Any, *, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{path} must be an integer, got {value!r}")
+    return value
+
+
+def _numeric_vector(value: Any, *, path: str) -> list[float]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"{path} must be an array")
+    result: list[float] = []
+    for index, item in enumerate(value):
+        if isinstance(item, bool):
+            raise ValueError(f"{path}[{index}] must be numeric, got {item!r}")
+        try:
+            number = float(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path}[{index}] must be numeric, got {item!r}") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{path}[{index}] must be finite, got {item!r}")
+        result.append(number)
+    return result
+
+
+def _validated_group(action_modalities: Mapping[str, Any], spec: _GroupSpec) -> dict[str, Any]:
+    entry = _require_mapping(action_modalities.get(spec.name), path=f"modality.action.{spec.name}")
+    source_start = _require_int(entry.get("start"), path=f"modality.action.{spec.name}.start")
+    source_end = _require_int(entry.get("end"), path=f"modality.action.{spec.name}.end")
+    source_key = entry.get("original_key", "action")
+    if not isinstance(source_key, str):
+        raise ValueError(f"modality.action.{spec.name}.original_key must be a string")
+
+    actual = (source_key, source_start, source_end)
+    expected = (spec.source_key, spec.source_start, spec.source_end)
+    if actual != expected:
+        raise ValueError(
+            f"modality.action.{spec.name} must resolve to {expected[0]}"
+            f"[{expected[1]}:{expected[2]}], got {actual[0]}[{actual[1]}:{actual[2]}]"
+        )
+    if source_end - source_start != spec.dim:
+        raise ValueError(
+            f"modality.action.{spec.name} has dimension {source_end - source_start}, "
+            f"expected {spec.dim}"
+        )
+    return {
+        "name": spec.name,
+        "start": spec.action_start,
+        "end": spec.action_end,
+        "source": {
+            "stats_key": source_key,
+            "start": source_start,
+            "end": source_end,
+        },
+    }
+
+
+def _collect_stats(
+    stats_payload: Mapping[str, Any], groups: Sequence[Mapping[str, Any]]
+) -> dict[str, list[float]]:
+    source_vectors: dict[tuple[str, str], list[float]] = {}
+    combined = {field: [] for field in STAT_FIELDS}
+
+    for group in groups:
+        source = _require_mapping(group["source"], path=f"layout.{group['name']}.source")
+        source_key = str(source["stats_key"])
+        source_start = int(source["start"])
+        source_end = int(source["end"])
+        source_stats = _require_mapping(stats_payload.get(source_key), path=f"stats.{source_key}")
+        for field in STAT_FIELDS:
+            cache_key = (source_key, field)
+            if cache_key not in source_vectors:
+                source_vectors[cache_key] = _numeric_vector(
+                    source_stats.get(field), path=f"stats.{source_key}.{field}"
+                )
+            vector = source_vectors[cache_key]
+            if len(vector) < source_end:
+                raise ValueError(
+                    f"stats.{source_key}.{field} has {len(vector)} channels, "
+                    f"but {group['name']} requires [{source_start}:{source_end}]"
+                )
+            combined[field].extend(vector[source_start:source_end])
+
+    for field, vector in combined.items():
+        if len(vector) != ACTION_DIM:
+            raise ValueError(f"assembled {field} has {len(vector)} channels, expected {ACTION_DIM}")
+
+    for index, (minimum, maximum, q01, q99, std) in enumerate(
+        zip(
+            combined["min"],
+            combined["max"],
+            combined["q01"],
+            combined["q99"],
+            combined["std"],
+            strict=True,
+        )
+    ):
+        if minimum > maximum:
+            raise ValueError(f"channel {index}: min {minimum} exceeds max {maximum}")
+        if q01 > q99:
+            raise ValueError(f"channel {index}: q01 {q01} exceeds q99 {q99}")
+        if q01 < minimum or q99 > maximum:
+            raise ValueError(
+                f"channel {index}: quantiles [{q01}, {q99}] fall outside "
+                f"observed range [{minimum}, {maximum}]"
+            )
+        if std < 0:
+            raise ValueError(f"channel {index}: std must be non-negative, got {std}")
+    return combined
+
+
+def _layout(groups: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    material = {
+        "name": LAYOUT_NAME,
+        "version": LAYOUT_VERSION,
+        "action_dim": ACTION_DIM,
+        "groups": list(groups),
+        "channel_names": list(CHANNEL_NAMES),
+    }
+    return {
+        **material,
+        # Runtime payloads can reproduce this without knowing dataset group
+        # provenance; the full contract remains separately fingerprinted.
+        "layout_hash": _sha256_bytes(_canonical_json_bytes(list(CHANNEL_NAMES))),
+        "contract_hash": _sha256_bytes(_canonical_json_bytes(material)),
+    }
+
+
+def build_online_stats(
+    stats_payload: Mapping[str, Any],
+    modality_payload: Mapping[str, Any],
+    *,
+    normalization_mode: str = "symmetric_quantile",
+    eps: float = 1e-6,
+    action_representation: str = "abs",
+    source_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convert LeRobot metadata into the versioned online-RLT stats schema.
+
+    This function performs no I/O.  It validates that ``modality.json`` still
+    describes the canonical Nero state-as-action layout before selecting and
+    concatenating source statistics.
+    """
+
+    stats_payload = _require_mapping(stats_payload, path="stats")
+    modality_payload = _require_mapping(modality_payload, path="modality")
+    if normalization_mode not in NORMALIZATION_MODES:
+        raise ValueError(
+            f"normalization_mode must be one of {NORMALIZATION_MODES}, got {normalization_mode!r}"
+        )
+    if action_representation != "abs":
+        raise ValueError(
+            "the Nero exporter supports only the absolute ('abs') action representation, "
+            f"got {action_representation!r}"
+        )
+    if isinstance(eps, bool) or not math.isfinite(float(eps)) or float(eps) <= 0:
+        raise ValueError(f"eps must be a finite positive number, got {eps!r}")
+    eps = float(eps)
+
+    action_modalities = _require_mapping(modality_payload.get("action"), path="modality.action")
+    groups = [_validated_group(action_modalities, spec) for spec in _GROUP_SPECS]
+    collected = _collect_stats(stats_payload, groups)
+
+    observed_min = list(collected["min"])
+    observed_max = list(collected["max"])
+    actions = {field: list(values) for field, values in collected.items()}
+    actions["observed_min"] = observed_min
+    actions["observed_max"] = observed_max
+    if normalization_mode == "quantile":
+        lower_key, upper_key = "q01", "q99"
+    else:
+        scale = [
+            max(abs(low), abs(high), eps)
+            for low, high in zip(collected["q01"], collected["q99"], strict=True)
+        ]
+        actions["min"] = [-value for value in scale]
+        actions["max"] = scale
+        lower_key, upper_key = "min", "max"
+
+    upstream = _require_mapping(
+        stats_payload.get("__fingerprints__", {}), path="stats.__fingerprints__"
+    )
+    selected_upstream = {
+        key: upstream[key] for key in ("action", "observation.state") if key in upstream
+    }
+    source = {
+        "fingerprint": source_fingerprint(stats_payload, modality_payload),
+        "upstream_stats_fingerprints": selected_upstream,
+    }
+    if source_metadata is not None:
+        metadata = _require_mapping(source_metadata, path="source_metadata")
+        conflicting = set(metadata).intersection(source)
+        if conflicting:
+            raise ValueError(
+                f"source_metadata cannot override reserved keys: {sorted(conflicting)}"
+            )
+        source.update(metadata)
+
+    return {
+        "schema": {"name": SCHEMA_NAME, "version": SCHEMA_VERSION},
+        "normalization": {
+            "action_representation": action_representation,
+            "mode": normalization_mode,
+            "lower_key": lower_key,
+            "upper_key": upper_key,
+            "normalized_range": [-1.0, 1.0],
+            "eps": eps,
+        },
+        "layout": _layout(groups),
+        "source": source,
+        "norm_stats": {"actions": actions},
+    }
+
+
+def _read_json_object(path: Path) -> tuple[Mapping[str, Any], bytes]:
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in {path}: {exc}") from exc
+    return _require_mapping(value, path=str(path)), raw
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, Any], *, overwrite: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"output already exists: {path}; pass --overwrite to replace it")
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(temp_name).replace(path)
+    finally:
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        required=True,
+        help="Prepared LeRobot dataset containing meta/stats.json and meta/modality.json.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output JSON path (default: <dataset-dir>/meta/rlt_online_action_stats.json).",
+    )
+    parser.add_argument(
+        "--normalization-mode",
+        choices=NORMALIZATION_MODES,
+        default="symmetric_quantile",
+    )
+    parser.add_argument("--eps", type=float, default=1e-6)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    dataset_dir = args.dataset_dir.expanduser().resolve()
+    stats_path = dataset_dir / "meta" / "stats.json"
+    modality_path = dataset_dir / "meta" / "modality.json"
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output is not None
+        else dataset_dir / "meta" / "rlt_online_action_stats.json"
+    )
+
+    stats_payload, stats_raw = _read_json_object(stats_path)
+    modality_payload, modality_raw = _read_json_object(modality_path)
+    payload = build_online_stats(
+        stats_payload,
+        modality_payload,
+        normalization_mode=args.normalization_mode,
+        eps=args.eps,
+        source_metadata={
+            "dataset_dir": str(dataset_dir),
+            "files": {
+                "stats.json": {"path": str(stats_path), "sha256": _sha256_bytes(stats_raw)},
+                "modality.json": {
+                    "path": str(modality_path),
+                    "sha256": _sha256_bytes(modality_raw),
+                },
+            },
+        },
+    )
+    _write_json_atomic(output_path, payload, overwrite=args.overwrite)
+    print(f"Wrote {ACTION_DIM}D {args.normalization_mode} absolute-action stats to {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

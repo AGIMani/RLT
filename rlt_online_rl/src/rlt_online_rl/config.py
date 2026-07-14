@@ -22,6 +22,14 @@ class RLTOnlineRLConfig:
     proprio_dim: int = 7
     action_representation: Literal["abs", "delta_chunk"] = "abs"
     action_norm_stats_path: str | None = None
+    # Optional ordered-layout fingerprints emitted by groot-rlt.  Configure
+    # these for Nero so state/action channel swaps fail before robot execution.
+    action_layout_hash: str | None = None
+    proprio_layout_hash: str | None = None
+    # Action channels converted between absolute and delta representations and
+    # used by the optional temporal-delta consistency loss. ``None`` preserves
+    # the historical Agilex behavior: the first min(6, action_dim) channels.
+    delta_action_indices: tuple[int, ...] | None = None
 
     gamma: float = 0.99
     fixed_std: float = 0.05
@@ -238,6 +246,10 @@ def _coerce_scalar_value(value: Any, annotation: Any) -> Any:
         return value
     if origin is Literal:
         return value
+    if origin is tuple:
+        args = get_args(annotation)
+        item_type = args[0] if args else Any
+        return tuple(_coerce_scalar_value(item, item_type) for item in value)
     if annotation is float:
         return float(value)
     if annotation is int:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import dataclasses
 import http
 from http.server import BaseHTTPRequestHandler
@@ -186,12 +186,37 @@ def normalize_feature_payload(
 
     normalized = dict(payload)
     normalized["z_rl"] = _coerce_feature_vector("z_rl", payload["z_rl"], rl_config.z_dim)
-    normalized["proprio"] = _proprio_from_observation(observation, rl_config)
-    normalized["ref_chunk"] = _coerce_ref_chunk(
+    observation_state = observation.get("state")
+    if isinstance(observation_state, Mapping):
+        if "proprio" not in payload:
+            raise ValueError(
+                "nested GR00T observation state requires Machine A to return a flat proprio vector."
+            )
+        normalized["proprio"] = _coerce_feature_vector(
+            "proprio", payload["proprio"], rl_config.proprio_dim
+        )
+    else:
+        normalized["proprio"] = _proprio_from_observation(observation, rl_config)
+    ref_chunk = _coerce_ref_chunk(
         payload["ref_chunk"],
         min_chunk_len=rl_config.chunk_len,
         min_action_dim=rl_config.action_dim,
-    )[: rl_config.chunk_len, : rl_config.action_dim]
+    )
+    if rl_config.action_layout_hash is not None and ref_chunk.shape[1] != rl_config.action_dim:
+        raise ValueError(
+            f"layout-validated ref_chunk must have exact action dim {rl_config.action_dim}, "
+            f"got {ref_chunk.shape[1]}"
+        )
+    normalized["ref_chunk"] = ref_chunk[: rl_config.chunk_len, : rl_config.action_dim]
+    for payload_key, expected in (
+        ("action_layout_hash", rl_config.action_layout_hash),
+        ("proprio_layout_hash", rl_config.proprio_layout_hash),
+    ):
+        if expected is not None and payload.get(payload_key) != expected:
+            raise ValueError(
+                f"Machine A {payload_key}={payload.get(payload_key)!r} does not match "
+                f"configured {expected!r}"
+            )
     return normalized
 
 
@@ -295,6 +320,10 @@ class ActorService:
         self._poll_thread: threading.Thread | None = None
         self._logged_missing_params = False
         self._packer = msgpack_numpy.Packer()
+        # Load an existing snapshot before accepting requests.  Falling back to
+        # the base chunk while the background poller is still compiling the
+        # initial actor is unsafe and makes startup timing machine-dependent.
+        self._try_reload_snapshot()
         self._start_param_poller()
 
     def infer(self, request: ActorRequest) -> ActorResponse:
@@ -563,6 +592,7 @@ class MachineAFeatureClient:
         self._recv_timeout_sec = recv_timeout_sec
         self._retry_interval_sec = retry_interval_sec
         self._packer = msgpack_numpy.Packer()
+        self._metadata: dict[str, Any] = {}
         self._ws = self._wait_for_server()
 
     def get_features(self, observation: dict[str, Any]) -> dict[str, Any]:
@@ -577,6 +607,8 @@ class MachineAFeatureClient:
         """
         if not observations:
             return []
+        if not bool(self._metadata.get("supports_batch", False)):
+            return [self.get_features(observation) for observation in observations]
         try:
             response = self._infer({"batch": observations})
             if isinstance(response, dict) and "batch_results" in response:
@@ -616,6 +648,7 @@ class MachineAFeatureClient:
                 metadata = msgpack_numpy.unpackb(ws.recv(timeout=self._recv_timeout_sec))
                 if not isinstance(metadata, dict):
                     raise RuntimeError(f"Machine A metadata must be a mapping, got {type(metadata).__name__}.")
+                self._metadata = dict(metadata)
                 logger.debug("Connected to Machine A feature server at %s", self._ws_url)
                 return ws
             except (

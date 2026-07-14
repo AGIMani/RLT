@@ -17,6 +17,7 @@ import optax
 
 from rlt_online_rl.action_representation import ActionRepresentationAdapter
 from rlt_online_rl.action_representation import jax_denormalize_to_abs_chunk
+from rlt_online_rl.action_representation import resolve_delta_indices
 from rlt_online_rl.config import LearnerServiceConfig
 from rlt_online_rl.config import RLTOnlineRLConfig
 from rlt_online_rl.config import relativize_rl_config_paths
@@ -234,6 +235,7 @@ def update_actor(
                 action_q01,
                 action_q99,
                 action_representation=rl_config.action_representation,
+                delta_action_indices=rl_config.delta_action_indices,
             )
             target_abs_chunk = jax_denormalize_to_abs_chunk(
                 bc_target,
@@ -241,10 +243,22 @@ def update_actor(
                 action_q01,
                 action_q99,
                 action_representation=rl_config.action_representation,
+                delta_action_indices=rl_config.delta_action_indices,
             )
-        pred_step_delta = pred_abs_chunk[:, 1:, :6] - pred_abs_chunk[:, :-1, :6]
-        target_step_delta = target_abs_chunk[:, 1:, :6] - target_abs_chunk[:, :-1, :6]
-        delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
+        delta_indices = resolve_delta_indices(
+            rl_config.action_dim,
+            rl_config.proprio_dim,
+            rl_config.delta_action_indices,
+        )
+        if delta_indices:
+            delta_index_array = jnp.asarray(delta_indices, dtype=jnp.int32)
+            pred_selected = pred_abs_chunk[..., delta_index_array]
+            target_selected = target_abs_chunk[..., delta_index_array]
+            pred_step_delta = pred_selected[:, 1:] - pred_selected[:, :-1]
+            target_step_delta = target_selected[:, 1:] - target_selected[:, :-1]
+            delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
+        else:
+            delta_penalty = jnp.asarray(0.0, dtype=jnp.float32)
         actor_q = jnp.mean(q1)
         weighted_bc = jnp.asarray(bc_weight, dtype=jnp.float32) * bc_penalty
         weighted_q = jnp.asarray(q_weight, dtype=jnp.float32) * actor_q

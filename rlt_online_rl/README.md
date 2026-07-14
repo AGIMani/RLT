@@ -177,8 +177,20 @@ The warmup and online stages can use different BC/Q weights:
 - `online_bc_weight`, `online_q_weight`
 
 `delta_penalty` is computed after converting normalized training actions back to
-executable absolute chunks, and currently compares step-to-step deltas for the
-first six arm joints.
+executable absolute chunks. `delta_action_indices` selects the compared action
+channels; when omitted it preserves the historical Agilex behavior and uses the
+first `min(6, action_dim)` channels. Non-contiguous indices can be supplied for
+GR00T/Nero layouts.
+
+For Nero, generate the 26D file with
+`groot-rlt-export-online-stats`; do not point this field directly at GR00T's
+grouped `statistics.json` or the raw 19D LeRobot action stats. The loader honors
+the export's declared `lower_key`/`upper_key`, including symmetric `min`/`max`
+bounds, and can verify `action_layout_hash`/`proprio_layout_hash` before use.
+
+Machine-A payloads may include a flat `proprio` vector. The runtime uses it only
+for GR00T's nested observation-state layout; a legacy flat `observation["state"]`
+remains authoritative even when the payload also contains `proprio`.
 
 ## Replay Windows
 
