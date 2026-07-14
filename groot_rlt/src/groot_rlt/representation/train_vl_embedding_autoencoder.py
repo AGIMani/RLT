@@ -38,6 +38,7 @@ from transformers import AutoConfig
 from transformers.feature_extraction_utils import BatchFeature
 
 from groot_rlt.groot_repo import ensure_groot_repo
+from groot_rlt.paths import VL_EMBEDDING_CACHE_DIR
 
 REPO_ROOT = ensure_groot_repo()
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -638,7 +639,12 @@ def make_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--max-steps", type=int, default=50000)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--dataloader-num-workers", type=int, default=0)
+    parser.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes. Use -1 for every CPU visible to the process.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-steps", type=int, default=100)
@@ -649,8 +655,11 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--embedding-cache-dir",
         type=str,
-        default=None,
-        help="Directory containing precomputed packed VL embedding shards.",
+        default=str(VL_EMBEDDING_CACHE_DIR),
+        help=(
+            "Directory containing precomputed packed VL embedding shards. "
+            "Defaults to the Groot-RLT project outputs/cache tree."
+        ),
     )
     parser.add_argument(
         "--precompute-vl-embeddings",
@@ -1853,6 +1862,14 @@ def autocast_context(device: torch.device, enabled: bool):
     return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
+def resolve_dataloader_num_workers(value: int) -> int:
+    if value == -1:
+        return max(1, os.cpu_count() or 1)
+    if value < 0:
+        raise ValueError("--dataloader-num-workers must be -1 or a non-negative integer")
+    return value
+
+
 def flush_embedding_shard(
     *,
     cache_dir: Path,
@@ -1913,11 +1930,12 @@ def precompute_vl_embedding_cache(
     train_dataset, processor = build_dataset_and_processor(
         args, model_cfg, transformers_loading_kwargs
     )
+    dataloader_num_workers = resolve_dataloader_num_workers(args.dataloader_num_workers)
     data_loader = DataLoader(
         OneEpochVLOnlyDataset(train_dataset),
         batch_size=args.batch_size,
         collate_fn=processor.collator,
-        num_workers=args.dataloader_num_workers,
+        num_workers=dataloader_num_workers,
         pin_memory=(device.type == "cuda"),
     )
 
@@ -1951,7 +1969,8 @@ def precompute_vl_embedding_cache(
 
     print(
         "Precomputing frozen VL embeddings: "
-        f"cache_dir={cache_dir}, batch_size={args.batch_size}, shard_size={args.shard_size}"
+        f"cache_dir={cache_dir}, batch_size={args.batch_size}, shard_size={args.shard_size}, "
+        f"dataloader_num_workers={dataloader_num_workers}"
     )
     for batch in data_loader:
         inputs = batch["inputs"]
@@ -2088,6 +2107,7 @@ def main() -> None:
         return
 
     using_cache = args.embedding_cache_dir is not None
+    dataloader_num_workers = resolve_dataloader_num_workers(args.dataloader_num_workers)
     cache_manifest = None
     ablation_loader = None
     if using_cache:
@@ -2103,7 +2123,7 @@ def main() -> None:
         data_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            num_workers=args.dataloader_num_workers,
+            num_workers=dataloader_num_workers,
             pin_memory=(device.type == "cuda"),
         )
         ablation_dataset = CachedVLEmbeddingDataset(cache_dir, seed=args.seed + 100_000)
@@ -2125,7 +2145,7 @@ def main() -> None:
             train_dataset,
             batch_size=args.batch_size,
             collate_fn=processor.collator,
-            num_workers=args.dataloader_num_workers,
+            num_workers=dataloader_num_workers,
             pin_memory=(device.type == "cuda"),
         )
 

@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from groot_rlt.groot_repo import ensure_groot_repo
+from groot_rlt.paths import VL_EMBEDDING_CACHE_DIR
 
 REPO_ROOT = ensure_groot_repo()
 
@@ -47,7 +48,7 @@ from groot_rlt.representation.train_vl_embedding_autoencoder import (  # noqa: E
 )
 
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "IsaacLab" / "vl_embedding_autoencoder_pi_cached"
-DEFAULT_CACHE_DIR = REPO_ROOT / "outputs" / "IsaacLab" / "vl_embedding_cache"
+DEFAULT_CACHE_DIR = VL_EMBEDDING_CACHE_DIR
 
 
 def parse_args() -> argparse.Namespace:

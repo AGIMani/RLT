@@ -11,6 +11,7 @@ episodes*/
 runs/
 .ruff_cache
 **/runs/
+outputs/cache/
 logs/
 metrics/
 *.pkl

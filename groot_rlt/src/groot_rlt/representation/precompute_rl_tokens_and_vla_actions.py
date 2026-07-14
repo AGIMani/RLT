@@ -43,6 +43,7 @@ import pandas as pd
 import torch
 
 from groot_rlt.groot_repo import ensure_groot_repo
+from groot_rlt.paths import VL_EMBEDDING_CACHE_DIR
 
 REPO_ROOT = ensure_groot_repo()
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -87,7 +88,7 @@ DEFAULT_DATASET_DIR = L10_PREPARED_DATASET_DIR
 DEFAULT_RL_CHECKPOINT_DIR = (
     REPO_ROOT / "outputs" / "IsaacLab" / "vl_embedding_autoencoder_pi_cached"
 )
-DEFAULT_EMBEDDING_CACHE_DIR = REPO_ROOT / "outputs" / "IsaacLab" / "vl_embedding_cache"
+DEFAULT_EMBEDDING_CACHE_DIR = VL_EMBEDDING_CACHE_DIR
 DEFAULT_RL_TOKEN_OUTPUT_DIR = REPO_ROOT / "outputs" / "IsaacLab" / "precomputed_rl_tokens"
 DEFAULT_VLA_ACTION_OUTPUT_DIR = (
     REPO_ROOT / "outputs" / "IsaacLab" / "precomputed_vla_reference_actions"

@@ -66,6 +66,9 @@ uv pip install --python .venv/bin/python \
 
 The GR00T checkout is resolved from `--groot-repo-path`, then
 `GROOT_REPO_PATH`, then common sibling-checkout locations.
+Generated RLT caches default to `$RLT_ROOT/outputs/cache`. Set
+`GROOT_RLT_PROJECT_ROOT` when the package is installed outside its source
+checkout (for example, set it to `/workspace/RLT` in a container).
 
 ## Primary `groot-rlt` workflow
 
@@ -82,13 +85,14 @@ groot-rlt train-token \
   --modality-config-path <modality-config.py> \
   --base-model-path <fine-tuned-groot-checkpoint> \
   --vlm-model-path <Cosmos-Reason2-2B> \
-  --embedding-cache-dir <embedding-cache-dir> \
+  --embedding-cache-dir "$RLT_ROOT/outputs/cache/vl_embeddings/<run-name>" \
+  --dataloader-num-workers -1 \
   --device cuda \
   --load-bf16
 
 groot-rlt train-token \
   --groot-repo-path "$GROOT_ROOT" \
-  --embedding-cache-dir <embedding-cache-dir> \
+  --embedding-cache-dir "$RLT_ROOT/outputs/cache/vl_embeddings/<run-name>" \
   --output-dir <rl-token-output-dir> \
   --max-steps 20000 \
   --batch-size 32 \

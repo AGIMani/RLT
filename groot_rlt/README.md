@@ -90,7 +90,8 @@ Example two-stage representation training:
 groot-rlt train-token \
   --groot-repo-path /home/whf/Project/Isaac-GR00T \
   --precompute-vl-embeddings \
-  --embedding-cache-dir /home/whf/Project/Isaac-GR00T/outputs/IsaacLab/vl_embedding_cache \
+  --embedding-cache-dir /home/whf/Project/RLT/outputs/cache/vl_embeddings/example \
+  --dataloader-num-workers -1 \
   --overwrite-cache \
   --dataset-dir <smooth-dataset> \
   --modality-config-path <modality-config.py> \
@@ -102,13 +103,18 @@ groot-rlt train-token \
 
 groot-rlt train-token \
   --groot-repo-path /home/whf/Project/Isaac-GR00T \
-  --embedding-cache-dir /home/whf/Project/Isaac-GR00T/outputs/IsaacLab/vl_embedding_cache \
+  --embedding-cache-dir /home/whf/Project/RLT/outputs/cache/vl_embeddings/example \
   --output-dir /home/whf/Project/Isaac-GR00T/outputs/IsaacLab/vl_embedding_autoencoder \
   --max-steps 20000 \
   --batch-size 32 \
   --autoencoder-bf16 \
   --device cuda
 ```
+
+RLT-owned caches default to `<RLT checkout>/outputs/cache`. In containers or
+non-editable installs, set `GROOT_RLT_PROJECT_ROOT` to the mounted RLT checkout.
+For cache construction, `--dataloader-num-workers -1` uses every CPU visible to
+the process.
 
 The migrated precompute command no longer imports private helpers from
 `examples.IsaacLab`; its checkpoint, LeRobot, image, and RTC helpers live under
