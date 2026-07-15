@@ -235,6 +235,9 @@ def main() -> None:
         "action_dim": contract.action_dim,
         "proprio_dim": contract.proprio_dim,
         "reference_action_space": "processor_decoded_physical",
+        # Only advertise a rotation contract that the backend recognized from
+        # the checkpoint modalities. Machine B rejects None for Nero runs.
+        "rot6d_convention": backend.rot6d_convention,
         "num_inference_timesteps": backend.num_inference_timesteps,
         "stateless_reference": True,
         "rtc_applied": False,

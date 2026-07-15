@@ -10,6 +10,12 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from groot_rlt.integration.nero_action_contract import (
+    ROT6D_CONVENTION,
+    VLA_REFERENCE_CHANNEL_NAMES,
+    semantic_layout_hash,
+)
+
 
 class FeatureBackend(Protocol):
     """Backend that produces one Machine-A payload from one observation."""
@@ -30,9 +36,15 @@ class FeatureContract:
                 raise ValueError(f"{name} must be positive")
 
 
-def channel_layout_hash(names: list[str] | tuple[str, ...]) -> str:
+def channel_layout_hash(
+    names: list[str] | tuple[str, ...],
+    *,
+    rotation_convention: str | None = None,
+) -> str:
     """Return a stable fingerprint for an ordered per-dimension layout."""
 
+    if rotation_convention is not None:
+        return semantic_layout_hash(names, rotation_convention=rotation_convention)
     payload = json.dumps(list(names), ensure_ascii=False, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -221,10 +233,10 @@ class GrootN1d7FeatureBackend:
         self.default_instruction = default_instruction
         action_keys = tuple(self.policy.modality_configs["action"].modality_keys)
         self.action_layout: list[str] | None = None
+        self.rot6d_convention: str | None = None
         if action_keys == ("eef_9d", "hand_joint_target", "arm_joint_target"):
-            from groot_rlt.integration.online_stats import CHANNEL_NAMES
-
-            self.action_layout = list(CHANNEL_NAMES)
+            self.action_layout = list(VLA_REFERENCE_CHANNEL_NAMES)
+            self.rot6d_convention = ROT6D_CONVENTION
         self.proprio_layout: list[str] | None = None
         if proprio_keys is None:
             try:
@@ -236,10 +248,20 @@ class GrootN1d7FeatureBackend:
                     f"{key}[{index}]" for key, dim in state_layout for index in range(dim)
                 ]
         self.action_layout_hash = (
-            None if self.action_layout is None else channel_layout_hash(self.action_layout)
+            None
+            if self.action_layout is None
+            else channel_layout_hash(
+                self.action_layout,
+                rotation_convention=self.rot6d_convention,
+            )
         )
         self.proprio_layout_hash = (
-            None if self.proprio_layout is None else channel_layout_hash(self.proprio_layout)
+            None
+            if self.proprio_layout is None
+            else channel_layout_hash(
+                self.proprio_layout,
+                rotation_convention=self.rot6d_convention,
+            )
         )
         self._pack_vl_tokens = pack_vl_tokens
         self._torch = torch
@@ -496,9 +518,16 @@ class GrootN1d7FeatureBackend:
             "proprio": self._extract_proprio(states[0]),
             "action_keys": action_keys,
             "action_layout": action_layout,
-            "action_layout_hash": channel_layout_hash(action_layout),
+            "action_layout_hash": channel_layout_hash(
+                action_layout,
+                rotation_convention=getattr(self, "rot6d_convention", None),
+            ),
             "proprio_layout": proprio_layout,
-            "proprio_layout_hash": channel_layout_hash(proprio_layout),
+            "proprio_layout_hash": channel_layout_hash(
+                proprio_layout,
+                rotation_convention=getattr(self, "rot6d_convention", None),
+            ),
+            "rot6d_convention": getattr(self, "rot6d_convention", None),
             "action_space": "processor_decoded_physical",
             "num_inference_timesteps": self.num_inference_timesteps,
             "rtc_applied": False,

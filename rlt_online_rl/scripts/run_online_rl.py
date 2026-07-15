@@ -122,6 +122,7 @@ def _run_replay_manager(system: OnlineRLSystemConfig) -> None:
     log_path = setup_process_logging("replay_manager", system, console_level=logging.WARNING)
     logger = logging.getLogger("replay_manager")
     from rlt_online_rl.replay import ReplayManager
+    from rlt_online_rl.replay import ReplayTensorContract
 
     stop_event = threading.Event()
 
@@ -147,6 +148,12 @@ def _run_replay_manager(system: OnlineRLSystemConfig) -> None:
         recent_online_ratio=system.replay.recent_online_ratio,
         warmup_demo_ratio=system.replay.warmup_demo_ratio,
         human_intervention_ratio=system.replay.human_intervention_ratio,
+        tensor_contract=ReplayTensorContract(
+            z_dim=system.rl.z_dim,
+            proprio_dim=system.rl.proprio_dim,
+            chunk_len=system.rl.chunk_len,
+            action_dim=system.rl.action_dim,
+        ),
     )
     manager.serve_forever(system.replay.bind_host, system.replay.port, stop_event=stop_event)
     logger.debug("replay_manager stopped.")

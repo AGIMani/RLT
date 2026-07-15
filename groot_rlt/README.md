@@ -13,8 +13,8 @@ The package contains three deliberately separate pieces:
    chunks, and proprio to the existing online-RL runtime.
 
 The first two pieces are usable without a robot. The third is a tested software
-contract, not a claim that the current 26D robot/teleop path has passed an
-end-to-end hardware rollout. See the root
+contract, not a claim that the 26D-reference/19D-command Teleop path has passed
+an end-to-end hardware rollout. See the root
 [README](../README.md) and [Teleop integration contract](../docs/groot_teleop_integration.md)
 for the current deployment boundary.
 
@@ -174,53 +174,77 @@ real-checkpoint smoke test before the server is used for collection.
 already normalized actor input. `rlt_online_rl.ActionRepresentationAdapter`
 must apply the task's action stats exactly once.
 
+Machine A deliberately returns the frozen checkpoint's complete reference:
+
+```text
+eef_9d[9] + hand_joint_target[10] + arm_joint_target[7] = 26D
+```
+
+This is a VLA reference and audit record, not the hardware command space. The
+Machine-B boundary validates the 26D source layout and explicitly selects the
+first 19 channels before actor/critic, replay, normalization, fallback, or
+execution. Proprio remains the complete 26D `eef9 + hand10 + arm7` state.
+
+The authoritative inference rot6d convention is row-first:
+
+```text
+[r00, r01, r02, r10, r11, r12]
+```
+
+The LeRobot v3 bridge reorders the state groups from `arm7 + eef9 + hand10` to
+`eef9 + hand10 + arm7`, but it does not transpose these six rotation values.
+Both the source-reference and executed-action layout hashes include this
+rotation convention.
+
 `--denoise-steps 32` reproduces the currently validated Nero flow-sampling
 setting; omitting it preserves the checkpoint value. The feature provider is
 intentionally stateless and does not apply RTC. RTC/history stitching belongs
 on the execution side: making feature extraction stateful would corrupt replay
 feature reconstruction when observations are requested out of order.
 
-## Nero 26D configuration
+## Nero 26D reference / 19D executed-action configuration
 
-The online runtime now accepts a server-provided `proprio`, which allows nested
+The online runtime accepts server-provided 26D `proprio`, which allows nested
 GR00T observations instead of requiring the old flat `observation["state"]`.
-It also supports configurable, non-contiguous delta channels:
+The actor, critic, replay action, normalization statistics, and executable
+fallback use only the real 19D EEF-and-hand command:
 
 ```yaml
 experiment:
   rl:
-    action_dim: 26
+    action_dim: 19
     proprio_dim: 26
     z_dim: 2048
     chunk_len: 10
     action_representation: abs
     action_norm_stats_path: /absolute/path/to/action_stats.json
-    action_layout_hash: sha256:<copy from exported stats>
+    action_layout_hash: sha256:<19D hash from exported stats>
     proprio_layout_hash: sha256:<copy from Machine-A metadata>
+    reference_action_dim: 26
+    reference_action_layout_hash: sha256:<26D hash from Machine-A metadata>
+    reference_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    rot6d_convention: groot_row_major_first_two_rows
     delta_action_indices: []
-```
-
-For a delta representation, list only channels whose actions and proprio share
-the same physical coordinates, for example:
-
-```yaml
-delta_action_indices: [0, 1, 2, 19, 20, 21, 22, 23, 24, 25]
 ```
 
 The provided Nero exporter intentionally emits `abs` stats. A `delta_chunk`
 experiment must compute q01/q99 from the transformed chunk labels themselves;
 renaming absolute stats as delta stats is invalid and is rejected by the loader.
-
-The historical Agilex behavior is unchanged when the field is omitted: the
-first `min(6, action_dim)` channels are used.
-
-State-as-action is supported. The essential invariant is that `proprio`, VLA
-reference, replay action, normalization stats, actor output, and deployment
-denormalization all use the same 26D ordering.
+The historical Agilex behavior is unchanged when `delta_action_indices` is
+omitted: the first `min(6, action_dim)` channels are used. Nero's absolute-action
+template sets it to an empty list.
 
 Export versioned Nero online-action stats directly from a prepared LeRobot
-dataset. The exporter validates the state-as-action aliases and writes the
-strict `eef_9d[9] + hand_joint_target[10] + arm_joint_target[7]` layout:
+dataset. The exporter validates and writes exactly the actually executed
+`eef_9d[9] + hand_joint_target[10] = 19D` layout; it never appends
+`observation.state[:7]` as a synthetic action:
+
+For the official v3/DAgger export, it reads `meta/info.json`, validates every
+state/action name plus `meta/teleop_stack_recap.json` policy-space metadata,
+and does not require a non-standard `meta/modality.json`.
+Legacy prepared datasets are accepted only when `meta/modality.json` explicitly
+declares `rotation_convention: groot_row_major_first_two_rows`; unnamed
+`rot6d_0..5` channels are never silently relabeled as the inference convention.
 
 ```bash
 groot-rlt export-online-stats \
@@ -271,6 +295,12 @@ left in Isaac-GR00T.
 
 After loading an old artifact, save it again to rewrite it with the new module
 paths.
+
+That module-path compatibility does not make an old 26D RLT tensor contract
+compatible with the current 19D actor/critic. Do not reuse former 26D actor or
+critic checkpoints, actor snapshots, action statistics, or replay journals.
+Create a separate 19D artifact directory. The frozen 400k GR00T checkpoint and
+its full 26D Machine-A reference remain intentionally reusable.
 
 ## Tests
 

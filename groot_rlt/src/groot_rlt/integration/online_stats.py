@@ -1,16 +1,7 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export Nero LeRobot statistics for the online RLT action adapter.
-
-The Nero policy emits one absolute 26D action in this exact order::
-
-    eef_9d[9] + hand_joint_target[10] + arm_joint_target[7]
-
-The first 19 channels come from the LeRobot ``action`` statistics.  Nero's
-state-as-action arm channels come from ``observation.state[0:7]``, as declared
-by ``arm_joint_target.original_key`` in ``meta/modality.json``.
-"""
+"""Export statistics for Nero's real 19D EEF-and-hand command space."""
 
 from __future__ import annotations
 
@@ -25,40 +16,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-SCHEMA_NAME = "rlt_online_action_stats"
-SCHEMA_VERSION = 2
-LAYOUT_NAME = "nero_right_l10_action"
-LAYOUT_VERSION = 1
-ACTION_DIM = 26
-
-CHANNEL_NAMES = (
-    "eef_9d.x",
-    "eef_9d.y",
-    "eef_9d.z",
-    "eef_9d.rot6d_0",
-    "eef_9d.rot6d_1",
-    "eef_9d.rot6d_2",
-    "eef_9d.rot6d_3",
-    "eef_9d.rot6d_4",
-    "eef_9d.rot6d_5",
-    "hand_joint_target.thumb_cmc_pitch",
-    "hand_joint_target.thumb_cmc_yaw",
-    "hand_joint_target.index_mcp_pitch",
-    "hand_joint_target.middle_mcp_pitch",
-    "hand_joint_target.ring_mcp_pitch",
-    "hand_joint_target.pinky_mcp_pitch",
-    "hand_joint_target.index_mcp_roll",
-    "hand_joint_target.ring_mcp_roll",
-    "hand_joint_target.pinky_mcp_roll",
-    "hand_joint_target.thumb_cmc_roll",
-    "arm_joint_target.0",
-    "arm_joint_target.1",
-    "arm_joint_target.2",
-    "arm_joint_target.3",
-    "arm_joint_target.4",
-    "arm_joint_target.5",
-    "arm_joint_target.6",
+from groot_rlt.integration.nero_action_contract import (
+    EXECUTED_ACTION_CHANNEL_NAMES,
+    EXECUTED_ACTION_DIM,
+    ROT6D_CONVENTION,
+    V3_ACTION_CHANNEL_NAMES,
+    V3_POLICY_SPACE_SCHEMA,
+    V3_STATE_CHANNEL_NAMES,
+    semantic_layout_hash,
 )
+
+SCHEMA_NAME = "rlt_online_action_stats"
+SCHEMA_VERSION = 3
+LAYOUT_NAME = "nero_right_l10_executed_action"
+LAYOUT_VERSION = 2
+ACTION_DIM = EXECUTED_ACTION_DIM
+CHANNEL_NAMES = EXECUTED_ACTION_CHANNEL_NAMES
 
 STAT_FIELDS = ("mean", "std", "min", "max", "q01", "q99")
 NORMALIZATION_MODES = ("quantile", "symmetric_quantile")
@@ -81,7 +54,6 @@ class _GroupSpec:
 _GROUP_SPECS = (
     _GroupSpec("eef_9d", 0, 9, "action", 0, 9),
     _GroupSpec("hand_joint_target", 9, 19, "action", 9, 19),
-    _GroupSpec("arm_joint_target", 19, 26, "observation.state", 0, 7),
 )
 
 
@@ -170,6 +142,140 @@ def _validated_group(action_modalities: Mapping[str, Any], spec: _GroupSpec) -> 
     }
 
 
+def _validated_v3_feature(
+    info_payload: Mapping[str, Any],
+    *,
+    key: str,
+    expected_dim: int,
+    expected_names: Sequence[str] | None,
+    dtype: str,
+) -> None:
+    features = _require_mapping(info_payload.get("features"), path="info.features")
+    feature = _require_mapping(features.get(key), path=f"info.features.{key}")
+    if feature.get("dtype") != dtype:
+        raise ValueError(
+            f"info.features.{key}.dtype must be {dtype!r}, got {feature.get('dtype')!r}"
+        )
+    shape = feature.get("shape")
+    if not isinstance(shape, Sequence) or isinstance(shape, (str, bytes, bytearray)):
+        raise ValueError(f"info.features.{key}.shape must be an array")
+    if list(shape) != [expected_dim]:
+        raise ValueError(f"info.features.{key}.shape must be [{expected_dim}], got {list(shape)!r}")
+    names = feature.get("names")
+    if expected_names is None:
+        if names is not None:
+            raise ValueError(f"info.features.{key}.names must be null, got {names!r}")
+        return
+    if not isinstance(names, Sequence) or isinstance(names, (str, bytes, bytearray)):
+        raise ValueError(f"info.features.{key}.names must be an array")
+    if list(names) != list(expected_names):
+        raise ValueError(
+            f"info.features.{key}.names do not match the validated {ROT6D_CONVENTION} contract"
+        )
+
+
+def modality_from_lerobot_v3_metadata(
+    info_payload: Mapping[str, Any],
+    recap_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the official v3 metadata and return the fixed 19D stats slices.
+
+    The action and state names are checked one by one. The result only assigns
+    already validated slices; it never reorders or transposes rot6d values.
+    """
+
+    info_payload = _require_mapping(info_payload, path="info")
+    recap_payload = _require_mapping(recap_payload, path="teleop_stack_recap")
+    if info_payload.get("codebase_version") != "v3.0":
+        raise ValueError(
+            f"info.codebase_version must be 'v3.0', got {info_payload.get('codebase_version')!r}"
+        )
+    if recap_payload.get("format_name") != "lerobot_v3_dagger":
+        raise ValueError(
+            "teleop_stack_recap.format_name must be 'lerobot_v3_dagger', got "
+            f"{recap_payload.get('format_name')!r}"
+        )
+    if recap_payload.get("normalization_schema") != V3_POLICY_SPACE_SCHEMA:
+        raise ValueError(
+            "teleop_stack_recap.normalization_schema must be "
+            f"{V3_POLICY_SPACE_SCHEMA!r}, got {recap_payload.get('normalization_schema')!r}"
+        )
+    policy_space = _require_mapping(
+        recap_payload.get("policy_space"), path="teleop_stack_recap.policy_space"
+    )
+    expected_frames = {
+        "observation_eef_frame": "policy_state",
+        "model_eef_frame": "policy_state",
+        "command_eef_frame": "genesis_world",
+    }
+    for key, expected in expected_frames.items():
+        if policy_space.get(key) != expected:
+            raise ValueError(
+                f"teleop_stack_recap.policy_space.{key} must be {expected!r}, "
+                f"got {policy_space.get(key)!r}"
+            )
+    transform = _require_mapping(
+        policy_space.get("state_to_genesis_transform"),
+        path="teleop_stack_recap.policy_space.state_to_genesis_transform",
+    )
+    expected_transform_values = {
+        "source_frame": "policy_state",
+        "target_frame": "genesis_world",
+        "rot6d_convention": ROT6D_CONVENTION,
+    }
+    for key, expected in expected_transform_values.items():
+        if transform.get(key) != expected:
+            raise ValueError(
+                "teleop_stack_recap.policy_space.state_to_genesis_transform."
+                f"{key} must be {expected!r}, got {transform.get(key)!r}"
+            )
+    for key, expected_dim in (
+        ("translation_xyz", 3),
+        ("quaternion_xyzw", 4),
+        ("eef_offset_translation_xyz", 3),
+        ("eef_offset_quaternion_xyzw", 4),
+    ):
+        vector = _numeric_vector(
+            transform.get(key),
+            path=f"teleop_stack_recap.policy_space.state_to_genesis_transform.{key}",
+        )
+        if len(vector) != expected_dim:
+            raise ValueError(
+                "teleop_stack_recap.policy_space.state_to_genesis_transform."
+                f"{key} must contain {expected_dim} values, got {len(vector)}"
+            )
+
+    _validated_v3_feature(
+        info_payload,
+        key="action",
+        expected_dim=len(V3_ACTION_CHANNEL_NAMES),
+        expected_names=V3_ACTION_CHANNEL_NAMES,
+        dtype="float32",
+    )
+    _validated_v3_feature(
+        info_payload,
+        key="observation.state",
+        expected_dim=len(V3_STATE_CHANNEL_NAMES),
+        expected_names=V3_STATE_CHANNEL_NAMES,
+        dtype="float32",
+    )
+    _validated_v3_feature(
+        info_payload,
+        key="intervention",
+        expected_dim=1,
+        expected_names=None,
+        dtype="bool",
+    )
+
+    return {
+        "rotation_convention": ROT6D_CONVENTION,
+        "action": {
+            "eef_9d": {"start": 0, "end": 9},
+            "hand_joint_target": {"start": 9, "end": 19},
+        },
+    }
+
+
 def _collect_stats(
     stats_payload: Mapping[str, Any], groups: Sequence[Mapping[str, Any]]
 ) -> dict[str, list[float]]:
@@ -231,12 +337,16 @@ def _layout(groups: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "action_dim": ACTION_DIM,
         "groups": list(groups),
         "channel_names": list(CHANNEL_NAMES),
+        "rotation_convention": ROT6D_CONVENTION,
     }
     return {
         **material,
         # Runtime payloads can reproduce this without knowing dataset group
         # provenance; the full contract remains separately fingerprinted.
-        "layout_hash": _sha256_bytes(_canonical_json_bytes(list(CHANNEL_NAMES))),
+        "layout_hash": semantic_layout_hash(
+            CHANNEL_NAMES,
+            rotation_convention=ROT6D_CONVENTION,
+        ),
         "contract_hash": _sha256_bytes(_canonical_json_bytes(material)),
     }
 
@@ -252,9 +362,8 @@ def build_online_stats(
 ) -> dict[str, Any]:
     """Convert LeRobot metadata into the versioned online-RLT stats schema.
 
-    This function performs no I/O.  It validates that ``modality.json`` still
-    describes the canonical Nero state-as-action layout before selecting and
-    concatenating source statistics.
+    This function performs no I/O. It validates the two actually executed
+    action groups and deliberately ignores the checkpoint-only arm prediction.
     """
 
     stats_payload = _require_mapping(stats_payload, path="stats")
@@ -272,6 +381,12 @@ def build_online_stats(
         raise ValueError(f"eps must be a finite positive number, got {eps!r}")
     eps = float(eps)
 
+    if modality_payload.get("rotation_convention") != ROT6D_CONVENTION:
+        raise ValueError(
+            "modality.rotation_convention must explicitly match the validated inference "
+            f"convention {ROT6D_CONVENTION!r}; got "
+            f"{modality_payload.get('rotation_convention')!r}"
+        )
     action_modalities = _require_mapping(modality_payload.get("action"), path="modality.action")
     groups = [_validated_group(action_modalities, spec) for spec in _GROUP_SPECS]
     collected = _collect_stats(stats_payload, groups)
@@ -295,9 +410,7 @@ def build_online_stats(
     upstream = _require_mapping(
         stats_payload.get("__fingerprints__", {}), path="stats.__fingerprints__"
     )
-    selected_upstream = {
-        key: upstream[key] for key in ("action", "observation.state") if key in upstream
-    }
+    selected_upstream = {key: upstream[key] for key in ("action",) if key in upstream}
     source = {
         "fingerprint": source_fingerprint(stats_payload, modality_payload),
         "upstream_stats_fingerprints": selected_upstream,
@@ -367,7 +480,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--dataset-dir",
         type=Path,
         required=True,
-        help="Prepared LeRobot dataset containing meta/stats.json and meta/modality.json.",
+        help=(
+            "Prepared LeRobot dataset. Official v3 uses meta/info.json plus "
+            "meta/teleop_stack_recap.json; legacy prepared datasets use meta/modality.json."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -389,6 +505,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     dataset_dir = args.dataset_dir.expanduser().resolve()
     stats_path = dataset_dir / "meta" / "stats.json"
+    info_path = dataset_dir / "meta" / "info.json"
+    recap_path = dataset_dir / "meta" / "teleop_stack_recap.json"
     modality_path = dataset_dir / "meta" / "modality.json"
     output_path = (
         args.output.expanduser().resolve()
@@ -397,7 +515,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     stats_payload, stats_raw = _read_json_object(stats_path)
-    modality_payload, modality_raw = _read_json_object(modality_path)
+    source_files: dict[str, dict[str, str]] = {
+        "stats.json": {"path": str(stats_path), "sha256": _sha256_bytes(stats_raw)}
+    }
+    source_format: str
+    if info_path.is_file():
+        info_payload, info_raw = _read_json_object(info_path)
+    else:
+        info_payload, info_raw = None, None
+    if info_payload is not None and info_payload.get("codebase_version") == "v3.0":
+        assert info_raw is not None
+        recap_payload, recap_raw = _read_json_object(recap_path)
+        modality_payload = modality_from_lerobot_v3_metadata(info_payload, recap_payload)
+        source_files.update(
+            {
+                "info.json": {"path": str(info_path), "sha256": _sha256_bytes(info_raw)},
+                "teleop_stack_recap.json": {
+                    "path": str(recap_path),
+                    "sha256": _sha256_bytes(recap_raw),
+                },
+            }
+        )
+        source_format = "lerobot_v3_dagger"
+    else:
+        modality_payload, modality_raw = _read_json_object(modality_path)
+        source_files["modality.json"] = {
+            "path": str(modality_path),
+            "sha256": _sha256_bytes(modality_raw),
+        }
+        source_format = "legacy_modality_json"
     payload = build_online_stats(
         stats_payload,
         modality_payload,
@@ -405,13 +551,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         eps=args.eps,
         source_metadata={
             "dataset_dir": str(dataset_dir),
-            "files": {
-                "stats.json": {"path": str(stats_path), "sha256": _sha256_bytes(stats_raw)},
-                "modality.json": {
-                    "path": str(modality_path),
-                    "sha256": _sha256_bytes(modality_raw),
-                },
-            },
+            "source_format": source_format,
+            "rotation_convention": ROT6D_CONVENTION,
+            "files": source_files,
         },
     )
     _write_json_atomic(output_path, payload, overwrite=args.overwrite)

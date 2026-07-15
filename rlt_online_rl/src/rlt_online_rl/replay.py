@@ -168,6 +168,40 @@ class RLTTransition:
         )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class ReplayTensorContract:
+    """Exact tensor shapes accepted by an online-RL replay journal."""
+
+    z_dim: int
+    proprio_dim: int
+    chunk_len: int
+    action_dim: int
+
+    def __post_init__(self) -> None:
+        for name in ("z_dim", "proprio_dim", "chunk_len", "action_dim"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive")
+
+    def validate(self, transition: RLTTransition, *, context: str) -> None:
+        expected_shapes = {
+            "z_rl": (self.z_dim,),
+            "proprio": (self.proprio_dim,),
+            "ref_chunk": (self.chunk_len, self.action_dim),
+            "action_chunk": (self.chunk_len, self.action_dim),
+            "rewards": (self.chunk_len,),
+            "next_z_rl": (self.z_dim,),
+            "next_proprio": (self.proprio_dim,),
+            "next_ref_chunk": (self.chunk_len, self.action_dim),
+            "source_chunk": (self.chunk_len,),
+        }
+        for name, expected_shape in expected_shapes.items():
+            value = np.asarray(getattr(transition, name))
+            if value.shape != expected_shape:
+                raise ValueError(f"{context} {name} has shape {value.shape}, expected {expected_shape}")
+            if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
+                raise ValueError(f"{context} {name} contains non-finite values")
+
+
 @dataclasses.dataclass(slots=True)
 class RawEpisodeStep:
     observation_idx: int
@@ -522,6 +556,7 @@ class ReplayManager:
         recent_online_ratio: float = 0.4,
         warmup_demo_ratio: float = 0.3,
         human_intervention_ratio: float = 0.2,
+        tensor_contract: ReplayTensorContract | None = None,
     ):
         self._buffer = ReplayBuffer(
             capacity,
@@ -533,6 +568,7 @@ class ReplayManager:
             human_intervention_ratio=human_intervention_ratio,
         )
         self._journal_path = journal_path
+        self._tensor_contract = tensor_contract
         self._metrics_path = metrics_path
         self._lock = threading.Lock()
         self._packer = msgpack_numpy.Packer()
@@ -544,6 +580,7 @@ class ReplayManager:
 
     def add_transition(self, transition: RLTTransition | dict[str, Any]) -> None:
         record = transition if isinstance(transition, RLTTransition) else RLTTransition.from_mapping(transition)
+        self._validate_record(record, context="replay add")
         with self._lock:
             self._buffer.add(record)
             self._append_journal(record)
@@ -566,6 +603,8 @@ class ReplayManager:
         ]
         if not records:
             return
+        for index, record in enumerate(records):
+            self._validate_record(record, context=f"replay extend record {index}")
 
         with self._lock:
             for record in records:
@@ -593,7 +632,12 @@ class ReplayManager:
             "adds_total": self._adds_total,
             "journal_path": self._journal_path,
             "max_episode_id": self._max_episode_id,
+            "tensor_contract": None if self._tensor_contract is None else dataclasses.asdict(self._tensor_contract),
         }
+
+    def _validate_record(self, record: RLTTransition, *, context: str) -> None:
+        if self._tensor_contract is not None:
+            self._tensor_contract.validate(record, context=context)
 
     def _append_journal(self, record: RLTTransition) -> None:
         self._append_journal_many([record])
@@ -617,6 +661,10 @@ class ReplayManager:
                 except EOFError:
                     break
                 record = RLTTransition.from_mapping(raw)
+                self._validate_record(
+                    record,
+                    context=f"replay journal {self._journal_path} record {restored}",
+                )
                 self._buffer.add(record)
                 restored += 1
                 self._max_episode_id = max(self._max_episode_id, int(record.episode_id))

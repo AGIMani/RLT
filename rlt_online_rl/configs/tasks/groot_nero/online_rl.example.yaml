@@ -1,8 +1,8 @@
-# Groot/Nero 26D starting point only. This file is intentionally fail-closed:
+# Groot/Nero 19D executed-action starting point. This file is intentionally fail-closed:
 # replace every REPLACE_* value and supply --env-factory before a robot run.
 experiment:
   rl:
-    action_dim: 26
+    action_dim: 19
     chunk_len: 10
     z_dim: 2048
     proprio_dim: 26
@@ -11,8 +11,14 @@ experiment:
     # to delta_chunk without recomputing statistics in the transformed space.
     action_representation: abs
     action_norm_stats_path: /REPLACE_WITH_EXPORTED/groot_online_action_stats.json
-    action_layout_hash: "sha256:REPLACE_WITH_ACTION_LAYOUT_HASH"
+    action_layout_hash: "sha256:REPLACE_WITH_19D_ACTION_LAYOUT_HASH"
     proprio_layout_hash: "sha256:REPLACE_WITH_PROPRIO_LAYOUT_HASH"
+    # Machine A retains the checkpoint's full 26D reference for audit. This
+    # explicit projection removes arm_joint_target before any actor/critic use.
+    reference_action_dim: 26
+    reference_action_layout_hash: "sha256:REPLACE_WITH_26D_REFERENCE_LAYOUT_HASH"
+    reference_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    rot6d_convention: groot_row_major_first_two_rows
     delta_action_indices: []
 
     gamma: 0.99
@@ -56,7 +62,7 @@ runtime:
     rpc_timeout_sec: 0.2
     bind_host: 127.0.0.1
     port: 9101
-    snapshot_path: ./runs/groot_nero/actor_snapshot/actor_snapshot.pkl
+    snapshot_path: ./runs/groot_nero_19d/actor_snapshot/actor_snapshot.pkl
     xla_mem_fraction: 0.10
     xla_preallocate: false
 
@@ -64,8 +70,8 @@ runtime:
     push_actor_interval_steps: 50
     checkpoint_interval_steps: 1000
     sample_batch_size: 256
-    checkpoint_dir: ./runs/groot_nero/checkpoints
-    actor_snapshot_path: ./runs/groot_nero/actor_snapshot/actor_snapshot.pkl
+    checkpoint_dir: ./runs/groot_nero_19d/checkpoints
+    actor_snapshot_path: ./runs/groot_nero_19d/actor_snapshot/actor_snapshot.pkl
     replay_url: http://127.0.0.1:9102
     poll_interval_sec: 0.01
     xla_mem_fraction: 0.75
@@ -73,7 +79,7 @@ runtime:
 
   replay:
     capacity: 200000
-    journal_path: ./runs/groot_nero/replay/replay_journal.pkl
+    journal_path: ./runs/groot_nero_19d/replay/replay_journal.pkl
     bind_host: 127.0.0.1
     port: 9102
     seed: 0

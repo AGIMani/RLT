@@ -22,10 +22,17 @@ class RLTOnlineRLConfig:
     proprio_dim: int = 7
     action_representation: Literal["abs", "delta_chunk"] = "abs"
     action_norm_stats_path: str | None = None
-    # Optional ordered-layout fingerprints emitted by groot-rlt.  Configure
-    # these for Nero so state/action channel swaps fail before robot execution.
+    # Actor/critic command-space fingerprint. Nero uses the real 19D EEF+hand
+    # command, independently of Machine A's complete 26D VLA reference.
     action_layout_hash: str | None = None
     proprio_layout_hash: str | None = None
+    # Optional explicit Machine-A reference projection. When configured, the
+    # source payload must match this exact dimension/hash and is projected by
+    # reference_action_indices before it reaches actor, critic, replay, or env.
+    reference_action_dim: int | None = None
+    reference_action_layout_hash: str | None = None
+    reference_action_indices: tuple[int, ...] | None = None
+    rot6d_convention: str | None = None
     # Action channels converted between absolute and delta representations and
     # used by the optional temporal-delta consistency loss. ``None`` preserves
     # the historical Agilex behavior: the first min(6, action_dim) channels.
@@ -55,6 +62,32 @@ class RLTOnlineRLConfig:
     freeze_after_warmup: bool = False
     # The paper reports a high update-to-data ratio of 5.
     grad_updates_per_cycle: int = 5
+
+    def __post_init__(self) -> None:
+        for name in ("action_dim", "chunk_len", "z_dim", "proprio_dim"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive")
+        projection_values = (
+            self.reference_action_dim,
+            self.reference_action_layout_hash,
+            self.reference_action_indices,
+        )
+        if any(value is not None for value in projection_values):
+            if any(value is None for value in projection_values) or self.action_layout_hash is None:
+                raise ValueError(
+                    "reference projection requires reference_action_dim, "
+                    "reference_action_layout_hash, reference_action_indices, and action_layout_hash"
+                )
+            assert self.reference_action_dim is not None
+            assert self.reference_action_indices is not None
+            if len(self.reference_action_indices) != self.action_dim:
+                raise ValueError(f"reference_action_indices must contain exactly action_dim={self.action_dim} entries")
+            if len(set(self.reference_action_indices)) != len(self.reference_action_indices):
+                raise ValueError("reference_action_indices must not contain duplicates")
+            if any(index < 0 or index >= self.reference_action_dim for index in self.reference_action_indices):
+                raise ValueError(
+                    f"reference_action_indices must be in range for reference_action_dim={self.reference_action_dim}"
+                )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,6 +194,48 @@ class OnlineRLSystemConfig:
 
 
 DEFAULT_CONFIG_FILENAME = "online_rl_config.yaml"
+
+_ACTION_CONTRACT_FIELDS = (
+    "action_dim",
+    "proprio_dim",
+    "chunk_len",
+    "z_dim",
+    "action_representation",
+    "action_layout_hash",
+    "proprio_layout_hash",
+    "reference_action_dim",
+    "reference_action_layout_hash",
+    "reference_action_indices",
+    "rot6d_convention",
+    "delta_action_indices",
+    "actor_hidden_dim",
+    "actor_num_layers",
+    "critic_hidden_dim",
+    "critic_num_layers",
+    "fixed_std",
+)
+
+
+def assert_action_contract_matches(
+    saved_config: Mapping[str, Any] | None,
+    current: RLTOnlineRLConfig,
+    *,
+    context: str,
+) -> None:
+    """Reject actor/critic artifacts created for a different tensor contract."""
+
+    if not isinstance(saved_config, Mapping):
+        raise ValueError(f"{context} does not contain an rl_config action contract")
+    mismatches = []
+    for name in _ACTION_CONTRACT_FIELDS:
+        saved = saved_config.get(name)
+        expected = getattr(current, name)
+        if name in {"reference_action_indices", "delta_action_indices"}:
+            saved = None if saved is None else tuple(saved)
+        if saved != expected:
+            mismatches.append(f"{name}: saved={saved!r} current={expected!r}")
+    if mismatches:
+        raise ValueError(f"{context} action contract mismatch: " + "; ".join(mismatches))
 
 
 def _resolve_path_from_config(path_value: str | None, config_path: str, *, require_exists: bool) -> str | None:

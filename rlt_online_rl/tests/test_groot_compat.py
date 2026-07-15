@@ -86,6 +86,30 @@ def test_flat_legacy_observation_remains_authoritative_for_proprio() -> None:
     assert np.array_equal(normalized["proprio"], observation["state"])
 
 
+def test_layout_validated_flat_proprio_rejects_implicit_truncation() -> None:
+    cfg = RLTOnlineRLConfig(
+        action_dim=3,
+        proprio_dim=3,
+        chunk_len=2,
+        z_dim=4,
+        action_layout_hash="sha256:action",
+        proprio_layout_hash="sha256:proprio",
+    )
+    payload = {
+        "z_rl": np.zeros((4,), dtype=np.float32),
+        "ref_chunk": np.zeros((2, 3), dtype=np.float32),
+        "action_layout_hash": "sha256:action",
+        "proprio_layout_hash": "sha256:proprio",
+    }
+
+    with pytest.raises(ValueError, match="exactly dim 3"):
+        normalize_feature_payload(
+            payload,
+            cfg,
+            observation={"state": np.zeros((4,), dtype=np.float32)},
+        )
+
+
 def test_machine_a_layout_mismatch_fails_before_action_use() -> None:
     cfg = RLTOnlineRLConfig(
         action_dim=3,

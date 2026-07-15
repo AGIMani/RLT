@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import dataclasses
+import hashlib
 import http
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
+import json
 import logging
 import os
 import pickle
@@ -26,6 +28,7 @@ from rlt_online_rl.action_representation import ActionRepresentationAdapter
 from rlt_online_rl.config import ActorServiceConfig
 from rlt_online_rl.config import EnvDriverConfig
 from rlt_online_rl.config import RLTOnlineRLConfig
+from rlt_online_rl.config import assert_action_contract_matches
 from rlt_online_rl.networks import ChunkActor
 from rlt_online_rl.networks import PyTree
 from rlt_online_rl.replay import DEFAULT_COLLECTION_PHASE
@@ -116,6 +119,7 @@ class ChunkFeatures:
     z_rl: np.ndarray
     proprio: np.ndarray
     ref_chunk: np.ndarray
+    source_ref_chunk: np.ndarray | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -146,18 +150,117 @@ def _coerce_feature_vector(name: str, value: Any, expected_dim: int) -> np.ndarr
         raise ValueError(f"{name} must be rank-1 or [1, D], got shape {array.shape}.")
     if array.shape[0] != expected_dim:
         raise ValueError(f"{name} expected dim {expected_dim}, got shape {array.shape}.")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains non-finite values.")
     return array
 
 
-def _coerce_ref_chunk(ref_chunk: Any, *, min_chunk_len: int, min_action_dim: int) -> np.ndarray:
+def _coerce_ref_chunk(ref_chunk: Any, *, min_chunk_len: int, action_dim: int) -> np.ndarray:
     array = np.asarray(ref_chunk, dtype=np.float32)
     if array.ndim == 3 and array.shape[0] == 1:
         array = array[0]
     if array.ndim != 2:
         raise ValueError(f"ref_chunk must be rank-2 or [1, T, A], got shape {array.shape}.")
-    if array.shape[0] < min_chunk_len or array.shape[1] < min_action_dim:
-        raise ValueError(f"ref_chunk must be at least [{min_chunk_len}, {min_action_dim}], got shape {array.shape}.")
+    if array.shape[0] < min_chunk_len or array.shape[1] != action_dim:
+        raise ValueError(f"ref_chunk must have shape [>={min_chunk_len}, {action_dim}], got {array.shape}.")
+    if not np.isfinite(array).all():
+        raise ValueError("ref_chunk contains non-finite values.")
     return array
+
+
+def _coerce_action_chunk(name: str, value: Any, *, expected_shape: tuple[int, int]) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.shape != expected_shape:
+        raise ValueError(f"{name} must have shape {expected_shape}, got {array.shape}.")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains non-finite values.")
+    return array
+
+
+def _coerce_action_vector(name: str, value: Any, *, action_dim: int) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float32)
+    if array.shape != (action_dim,):
+        raise ValueError(f"{name} must have shape ({action_dim},), got {array.shape}.")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains non-finite values.")
+    return array
+
+
+def _semantic_layout_hash(channel_names: list[str], rotation_convention: str | None) -> str:
+    material = {
+        "channel_names": list(channel_names),
+        "rotation_convention": rotation_convention,
+    }
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _project_machine_a_reference(
+    payload: dict[str, Any],
+    rl_config: RLTOnlineRLConfig,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    source_dim = rl_config.reference_action_dim
+    indices = rl_config.reference_action_indices
+    source_hash = rl_config.reference_action_layout_hash
+    projected_hash = rl_config.action_layout_hash
+
+    projection_configured = any(value is not None for value in (source_dim, indices, source_hash))
+    if not projection_configured:
+        source = _coerce_ref_chunk(
+            payload["ref_chunk"],
+            min_chunk_len=rl_config.chunk_len,
+            action_dim=rl_config.action_dim,
+        )[: rl_config.chunk_len]
+        if projected_hash is not None and payload.get("action_layout_hash") != projected_hash:
+            raise ValueError(
+                f"Machine A action_layout_hash={payload.get('action_layout_hash')!r} does not "
+                f"match configured {projected_hash!r}"
+            )
+        return source.copy(), None
+
+    if source_dim is None or indices is None or source_hash is None or projected_hash is None:
+        raise ValueError(
+            "reference projection requires reference_action_dim, reference_action_indices, "
+            "reference_action_layout_hash, and action_layout_hash"
+        )
+    if len(indices) != rl_config.action_dim:
+        raise ValueError(f"reference_action_indices has {len(indices)} entries, expected {rl_config.action_dim}")
+    if len(set(indices)) != len(indices) or any(index < 0 or index >= source_dim for index in indices):
+        raise ValueError(f"reference_action_indices are invalid for source dim {source_dim}: {indices}")
+
+    source = _coerce_ref_chunk(
+        payload["ref_chunk"],
+        min_chunk_len=rl_config.chunk_len,
+        action_dim=source_dim,
+    )[: rl_config.chunk_len]
+    if payload.get("action_layout_hash") != source_hash:
+        raise ValueError(
+            f"Machine A source action_layout_hash={payload.get('action_layout_hash')!r} does not "
+            f"match configured reference_action_layout_hash={source_hash!r}"
+        )
+    source_layout = payload.get("action_layout")
+    if not isinstance(source_layout, (list, tuple)) or len(source_layout) != source_dim:
+        raise ValueError(f"Machine A action_layout must contain {source_dim} source names for projection")
+    if rl_config.rot6d_convention is not None and payload.get("rot6d_convention") != rl_config.rot6d_convention:
+        raise ValueError(
+            f"Machine A rot6d_convention={payload.get('rot6d_convention')!r} does not match "
+            f"configured {rl_config.rot6d_convention!r}"
+        )
+    projected_layout = [str(source_layout[index]) for index in indices]
+    actual_projected_hash = _semantic_layout_hash(projected_layout, rl_config.rot6d_convention)
+    if actual_projected_hash != projected_hash:
+        raise ValueError(
+            f"projected Machine A action layout hash {actual_projected_hash!r} does not match "
+            f"configured action_layout_hash={projected_hash!r}"
+        )
+    projected = source[:, np.asarray(indices, dtype=np.int64)]
+    return projected.astype(np.float32, copy=True), source.astype(np.float32, copy=True)
 
 
 def _proprio_from_observation(observation: dict[str, Any], rl_config: RLTOnlineRLConfig) -> np.ndarray:
@@ -166,9 +269,14 @@ def _proprio_from_observation(observation: dict[str, Any], rl_config: RLTOnlineR
     state = np.asarray(observation["state"], dtype=np.float32)
     if state.ndim == 2 and state.shape[0] == 1:
         state = state[0]
-    if state.ndim != 1 or state.shape[0] < rl_config.proprio_dim:
+    expected_exact = rl_config.proprio_layout_hash is not None
+    invalid_dim = state.ndim != 1 or (
+        state.shape[0] != rl_config.proprio_dim if expected_exact else state.shape[0] < rl_config.proprio_dim
+    )
+    if invalid_dim:
+        expectation = "exactly" if expected_exact else "at least"
         raise ValueError(
-            f"observation state must be rank-1 with dim >= {rl_config.proprio_dim}, got shape {state.shape}."
+            f"observation state must be rank-1 with {expectation} dim {rl_config.proprio_dim}, got shape {state.shape}."
         )
     return state[: rl_config.proprio_dim].astype(np.float32, copy=False)
 
@@ -189,33 +297,18 @@ def normalize_feature_payload(
     observation_state = observation.get("state")
     if isinstance(observation_state, Mapping):
         if "proprio" not in payload:
-            raise ValueError(
-                "nested GR00T observation state requires Machine A to return a flat proprio vector."
-            )
-        normalized["proprio"] = _coerce_feature_vector(
-            "proprio", payload["proprio"], rl_config.proprio_dim
-        )
+            raise ValueError("nested GR00T observation state requires Machine A to return a flat proprio vector.")
+        normalized["proprio"] = _coerce_feature_vector("proprio", payload["proprio"], rl_config.proprio_dim)
     else:
         normalized["proprio"] = _proprio_from_observation(observation, rl_config)
-    ref_chunk = _coerce_ref_chunk(
-        payload["ref_chunk"],
-        min_chunk_len=rl_config.chunk_len,
-        min_action_dim=rl_config.action_dim,
-    )
-    if rl_config.action_layout_hash is not None and ref_chunk.shape[1] != rl_config.action_dim:
-        raise ValueError(
-            f"layout-validated ref_chunk must have exact action dim {rl_config.action_dim}, "
-            f"got {ref_chunk.shape[1]}"
-        )
-    normalized["ref_chunk"] = ref_chunk[: rl_config.chunk_len, : rl_config.action_dim]
-    for payload_key, expected in (
-        ("action_layout_hash", rl_config.action_layout_hash),
-        ("proprio_layout_hash", rl_config.proprio_layout_hash),
-    ):
+    projected_ref, source_ref = _project_machine_a_reference(payload, rl_config)
+    normalized["ref_chunk"] = projected_ref
+    if source_ref is not None:
+        normalized["source_ref_chunk"] = source_ref
+    for payload_key, expected in (("proprio_layout_hash", rl_config.proprio_layout_hash),):
         if expected is not None and payload.get(payload_key) != expected:
             raise ValueError(
-                f"Machine A {payload_key}={payload.get(payload_key)!r} does not match "
-                f"configured {expected!r}"
+                f"Machine A {payload_key}={payload.get(payload_key)!r} does not match configured {expected!r}"
             )
     return normalized
 
@@ -224,20 +317,31 @@ def _chunk_features_from_payload(payload: dict[str, Any], rl_config: RLTOnlineRL
     return ChunkFeatures(
         z_rl=np.asarray(payload["z_rl"], dtype=np.float32),
         proprio=np.asarray(payload["proprio"], dtype=np.float32),
-        ref_chunk=np.asarray(payload["ref_chunk"], dtype=np.float32)[: rl_config.chunk_len, : rl_config.action_dim],
+        ref_chunk=np.asarray(payload["ref_chunk"], dtype=np.float32),
+        source_ref_chunk=None
+        if "source_ref_chunk" not in payload
+        else np.asarray(payload["source_ref_chunk"], dtype=np.float32),
     )
 
 
 def _normalize_cached_feature_payload(payload: dict[str, Any], rl_config: RLTOnlineRLConfig) -> dict[str, np.ndarray]:
-    return {
+    normalized = {
         "z_rl": _coerce_feature_vector("z_rl", payload["z_rl"], rl_config.z_dim),
         "proprio": _coerce_feature_vector("proprio", payload["proprio"], rl_config.proprio_dim),
         "ref_chunk": _coerce_ref_chunk(
             payload["ref_chunk"],
             min_chunk_len=rl_config.chunk_len,
-            min_action_dim=rl_config.action_dim,
-        )[: rl_config.chunk_len, : rl_config.action_dim],
+            action_dim=rl_config.action_dim,
+        )[: rl_config.chunk_len],
     }
+    if "source_ref_chunk" in payload:
+        source_dim = rl_config.reference_action_dim or rl_config.action_dim
+        normalized["source_ref_chunk"] = _coerce_ref_chunk(
+            payload["source_ref_chunk"],
+            min_chunk_len=rl_config.chunk_len,
+            action_dim=source_dim,
+        )[: rl_config.chunk_len]
+    return normalized
 
 
 class RLTPolicyInferenceWrapper:
@@ -327,6 +431,17 @@ class ActorService:
         self._start_param_poller()
 
     def infer(self, request: ActorRequest) -> ActorResponse:
+        z_rl = _coerce_feature_vector("actor request z_rl", request.z_rl, self._rl_config.z_dim)
+        proprio = _coerce_feature_vector(
+            "actor request proprio",
+            request.proprio,
+            self._rl_config.proprio_dim,
+        )
+        ref_chunk = _coerce_action_chunk(
+            "actor request ref_chunk",
+            request.ref_chunk,
+            expected_shape=(self._rl_config.chunk_len, self._rl_config.action_dim),
+        )
         with self._lock:
             actor_params = self._actor_params
             actor_version = self._actor_version
@@ -338,25 +453,30 @@ class ActorService:
                 logger.info("No actor snapshot loaded yet; falling back to ref_chunk.")
                 self._logged_missing_params = True
             return ActorResponse(
-                refined_chunk=np.asarray(request.ref_chunk, dtype=np.float32),
+                refined_chunk=ref_chunk.copy(),
                 actor_param_version=actor_version,
                 request_id=request.request_id,
                 timestamp=time.time(),
                 source=int(TransitionSource.BASE),
             )
-        model_ref_chunk = np.asarray(request.ref_chunk, dtype=np.float32)
+        model_ref_chunk = ref_chunk
         if self._action_adapter is not None:
-            model_ref_chunk = self._action_adapter.normalize_ref_chunk(model_ref_chunk, request.proprio)
+            model_ref_chunk = self._action_adapter.normalize_ref_chunk(model_ref_chunk, proprio)
         refined_chunk = self._wrapper.infer(
             actor_params,
-            request.z_rl,
-            request.proprio,
+            z_rl,
+            proprio,
             model_ref_chunk,
             rng=infer_rng,
             deterministic=request.deterministic,
         )
         if self._action_adapter is not None:
-            refined_chunk = self._action_adapter.denormalize_to_abs_chunk(refined_chunk, request.proprio)
+            refined_chunk = self._action_adapter.denormalize_to_abs_chunk(refined_chunk, proprio)
+        refined_chunk = _coerce_action_chunk(
+            "actor response refined_chunk",
+            refined_chunk,
+            expected_shape=ref_chunk.shape,
+        )
         return ActorResponse(
             refined_chunk=refined_chunk,
             actor_param_version=actor_version,
@@ -475,6 +595,11 @@ class ActorService:
                 payload = pickle.load(f)
         except (EOFError, FileNotFoundError, pickle.UnpicklingError):
             return
+        assert_action_contract_matches(
+            payload.get("rl_config"),
+            self._rl_config,
+            context=f"actor snapshot {self._snapshot_path}",
+        )
         version = int(payload["version"])
         with self._lock:
             current_version = self._actor_version
@@ -819,8 +944,13 @@ class EnvDriver:
                         )
                 if self._safe_action_filter is not None:
                     action_chunk = self._safe_action_filter(action_chunk)
+                action_chunk = _coerce_action_chunk(
+                    "planned action_chunk",
+                    action_chunk,
+                    expected_shape=ref_chunk.shape,
+                )
                 return PolicyPlan(
-                    action_chunk=np.asarray(action_chunk, dtype=np.float32),
+                    action_chunk=action_chunk,
                     ref_chunk=np.asarray(ref_chunk, dtype=np.float32),
                     source=int(source),
                     start_features=current_features,
@@ -1060,11 +1190,14 @@ class EnvDriver:
         features: ChunkFeatures,
     ) -> None:
         anchors = raw_episode.summary.setdefault("feature_anchors", {})
-        anchors[int(observation_idx)] = {
+        payload = {
             "z_rl": np.asarray(features.z_rl, dtype=np.float32),
             "proprio": np.asarray(features.proprio, dtype=np.float32),
             "ref_chunk": np.asarray(features.ref_chunk, dtype=np.float32),
         }
+        if features.source_ref_chunk is not None:
+            payload["source_ref_chunk"] = np.asarray(features.source_ref_chunk, dtype=np.float32)
+        anchors[int(observation_idx)] = payload
 
     def _persist_raw_episode(self, raw_episode: RawEpisodeTrace, *, episode_id: int, started_at: float) -> str:
         journal_path = self._replay_client.stats()["journal_path"]
@@ -1412,8 +1545,16 @@ class EnvDriver:
         for offset, trace_step in enumerate(step_trace):
             done = bool(trace_step.get("done", False))
             human_controlled = bool(trace_step.get("human_controlled", False))
-            action = np.asarray(trace_step["action"], dtype=np.float32)[: self._rl_config.action_dim]
-            ref_action = np.asarray(trace_step["ref_action"], dtype=np.float32)[: self._rl_config.action_dim]
+            action = _coerce_action_vector(
+                "step trace action",
+                trace_step["action"],
+                action_dim=self._rl_config.action_dim,
+            )
+            ref_action = _coerce_action_vector(
+                "step trace ref_action",
+                trace_step["ref_action"],
+                action_dim=self._rl_config.action_dim,
+            )
             records.append(
                 StepTraceRecord(
                     observation=trace_step["observation"],

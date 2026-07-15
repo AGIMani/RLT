@@ -22,6 +22,7 @@ from rlt_online_rl.inference import ActorRequest
 from rlt_online_rl.inference import ActorService
 from rlt_online_rl.inference import EnvDriver
 from rlt_online_rl.inference import RLTPolicyInferenceWrapper
+from rlt_online_rl.inference import _semantic_layout_hash
 from rlt_online_rl.inference import maybe_refine_chunk
 from rlt_online_rl.inference import normalize_feature_payload
 from rlt_online_rl.networks import ChunkActor
@@ -234,6 +235,16 @@ def test_actor_param_version_hot_update(tmp_path) -> None:
     assert service.actor_param_version == 2
 
 
+def test_actor_service_rejects_snapshot_from_different_action_contract(tmp_path) -> None:
+    cfg = _config()
+    incompatible_cfg = dataclasses.replace(cfg, action_dim=cfg.action_dim + 1)
+    snapshot_path = tmp_path / "actor.pkl"
+    _write_snapshot(str(snapshot_path), 1, incompatible_cfg, seed=0)
+
+    with np.testing.assert_raises_regex(ValueError, "action contract mismatch"):
+        ActorService(cfg, ActorServiceConfig(snapshot_path=str(snapshot_path)))
+
+
 def test_inference_default_uses_actor_mean_without_dropout(tmp_path) -> None:
     cfg = _config()
     snapshot_path = tmp_path / "actor.pkl"
@@ -280,7 +291,7 @@ def test_feature_payload_normalizes_singleton_rl_token_shapes() -> None:
     payload = normalize_feature_payload(
         {
             "z_rl": np.ones((1, cfg.z_dim), dtype=np.float32),
-            "ref_chunk": np.ones((1, cfg.chunk_len + 40, cfg.action_dim + 2), dtype=np.float32),
+            "ref_chunk": np.ones((1, cfg.chunk_len + 40, cfg.action_dim), dtype=np.float32),
         },
         cfg,
         observation={"state": np.full((cfg.proprio_dim,), 3.0, dtype=np.float32)},
@@ -289,6 +300,75 @@ def test_feature_payload_normalizes_singleton_rl_token_shapes() -> None:
     assert payload["proprio"].shape == (cfg.proprio_dim,)
     assert np.allclose(payload["proprio"], 3.0)
     assert payload["ref_chunk"].shape == (cfg.chunk_len, cfg.action_dim)
+
+
+def test_feature_payload_rejects_implicit_action_truncation() -> None:
+    cfg = _config()
+    with np.testing.assert_raises_regex(ValueError, "ref_chunk must have shape"):
+        normalize_feature_payload(
+            {
+                "z_rl": np.ones((cfg.z_dim,), dtype=np.float32),
+                "ref_chunk": np.ones((cfg.chunk_len, cfg.action_dim + 2), dtype=np.float32),
+            },
+            cfg,
+            observation={"state": np.zeros((cfg.proprio_dim,), dtype=np.float32)},
+        )
+
+
+def test_machine_a_26d_reference_is_explicitly_projected_before_network_use() -> None:
+    source_layout = [
+        "eef_9d.x",
+        "eef_9d.y",
+        "eef_9d.z",
+        "eef_9d.rot6d.r00",
+        "eef_9d.rot6d.r01",
+        "eef_9d.rot6d.r02",
+        "eef_9d.rot6d.r10",
+        "eef_9d.rot6d.r11",
+        "eef_9d.rot6d.r12",
+        *(f"hand_joint_target.{index}" for index in range(10)),
+        *(f"arm_joint_target.{index}" for index in range(7)),
+    ]
+    target_layout = source_layout[:19]
+    convention = "groot_row_major_first_two_rows"
+    source_hash = _semantic_layout_hash(source_layout, convention)
+    target_hash = _semantic_layout_hash(target_layout, convention)
+    cfg = dataclasses.replace(
+        _config(),
+        action_dim=19,
+        reference_action_dim=26,
+        reference_action_layout_hash=source_hash,
+        reference_action_indices=tuple(range(19)),
+        action_layout_hash=target_hash,
+        rot6d_convention=convention,
+    )
+    source_ref = np.zeros((cfg.chunk_len, 26), dtype=np.float32)
+    source_ref[:, :19] = np.arange(19, dtype=np.float32)
+    inference_rot6d = np.asarray([100.0, 101.0, 102.0, 110.0, 111.0, 112.0])
+    source_ref[:, 3:9] = inference_rot6d
+    source_ref[:, 19:] = 9999.0
+
+    normalized = normalize_feature_payload(
+        {
+            "z_rl": np.ones((cfg.z_dim,), dtype=np.float32),
+            "proprio": np.arange(cfg.proprio_dim, dtype=np.float32),
+            "ref_chunk": source_ref,
+            "action_layout": source_layout,
+            "action_layout_hash": source_hash,
+            "rot6d_convention": convention,
+        },
+        cfg,
+        observation={"state": {"nested": np.zeros((1, 1, cfg.proprio_dim))}},
+    )
+
+    assert normalized["ref_chunk"].shape == (cfg.chunk_len, cfg.action_dim)
+    np.testing.assert_array_equal(normalized["ref_chunk"], source_ref[:, :19])
+    np.testing.assert_array_equal(
+        normalized["ref_chunk"][:, 3:9],
+        np.repeat(inference_rot6d[None, :], cfg.chunk_len, axis=0),
+    )
+    np.testing.assert_array_equal(normalized["source_ref_chunk"], source_ref)
+    assert not np.any(normalized["ref_chunk"] == 9999.0)
 
 
 def test_trace_records_keep_actor_version_for_raw_episode() -> None:
@@ -397,7 +477,7 @@ def test_replay_crops_cached_feature_ref_horizon() -> None:
     raw_episode = _make_raw_episode(cfg, total_steps=20)
     for chunk in raw_episode.chunks:
         chunk.start_ref_chunk = np.full(
-            (cfg.chunk_len + 40, cfg.action_dim + 2),
+            (cfg.chunk_len + 40, cfg.action_dim),
             float(chunk.observation_idx),
             dtype=np.float32,
         )

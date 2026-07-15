@@ -6,9 +6,12 @@ live Groot-RLT adapter. It is deliberately not a real-robot launch guide.
 
 ## Decision
 
-Do not connect the current 26D RLT action directly to the Teleop hardware path.
-Keep the existing Pika/Agilex ROS adapter unchanged and add a separate Teleop
-policy adapter only after the action-space mismatch below is resolved.
+Do not connect Machine A's 26D VLA reference directly to the Teleop hardware
+path. Machine A keeps that complete reference for the frozen 400k checkpoint,
+while Machine B explicitly projects it to the real 19D EEF-and-hand command
+before actor/critic, replay, normalization, fallback, or execution. Keep the
+existing Pika/Agilex ROS adapter unchanged and add a separate Teleop policy
+adapter for this contract.
 
 Teleop already owns the safety-critical parts of the loop:
 
@@ -38,10 +41,11 @@ The intended live shape is:
 ```text
 PolicyObservation
   -> GrootRltTeleopPolicy.infer(...)
-       -> Machine A: z_rl + physical GR00T reference + proprio
-       -> Machine B: actor refinement
+       -> Machine A: z_rl + 26D physical GR00T reference + 26D proprio
+       -> Machine B: validate source metadata and project 26D -> 19D
+       -> Machine B: 19D actor/critic/replay refinement
        -> denormalize exactly once
-       -> validated 26D physical action converter
+       -> validated 19D EEF-and-hand command converter
   -> PolicyActionChunk
   -> PolicyTrajectoryManager
   -> ActionAuthorityMux
@@ -52,33 +56,48 @@ PolicyObservation
 or supersede policy authority there, while preserving the policy proposal and
 reference action for replay provenance.
 
-## Blocking action-space mismatch
+## Action-space contract
 
-The currently supported Groot-RLT/Nero layout is:
+The reference, executable action, and proprio contracts are intentionally
+different:
 
 ```text
-eef_9d[9] + hand_joint_target[10] + arm_joint_target[7] = 26D
+Machine A reference: eef_9d[9] + hand_joint_target[10] + arm_joint_target[7] = 26D
+Machine B action:    eef_9d[9] + hand_joint_target[10]                         = 19D
+Machine B proprio:  eef_9d[9] + hand_joint_pos[10] + arm_joint_pos[7]          = 26D
 ```
 
 The inspected Teleop `action_dict_to_commands` path creates a
-`SingleArmTeleopCommand` from `eef_9d` and `hand_joint_target`. In that path the
-additional `arm_joint_target[7]` is not represented by the emitted command.
+`SingleArmTeleopCommand` from `eef_9d` and `hand_joint_target`, so the 19D
+Machine-B action is exactly the command space the robot consumes. Machine A's
+seven `arm_joint_target` values remain available as frozen-checkpoint reference
+provenance, but they never enter the actor, critic, replay action, action
+statistics, fallback command, or hardware converter.
 
-A direct adapter would therefore advertise and normalize 26 channels while the
-hardware command consumes only 19 of them. This would invalidate actor/critic
-training, layout hashes, reference regularization, and replay interpretation.
-It must fail closed rather than silently project the chunk.
+The Machine-B boundary must validate an exact 26D source dimension, full source
+layout hash, and rotation convention, then select the declared indices `0:19`.
+It independently validates the resulting 19D semantic layout hash. An implicit
+slice, padding, or execution-only projection is forbidden.
 
-One of these designs must be chosen and reflected consistently in the GR00T
-checkpoint, feature server, statistics, actor, replay, and command converter:
+This changes the actor and critic tensor shapes. Former 26D RLT actor/critic
+checkpoints, actor snapshots, action statistics, and replay journals are not
+compatible and must not be reused. Start a separate 19D run. The frozen 400k
+GR00T checkpoint on Machine A remains compatible because its 26D output is
+preserved.
 
-1. a true 26D command envelope whose robot adapter consumes all 26 channels;
-2. a documented 19D deployment action space with a separately trained/exported
-   19D checkpoint, statistics, layout hash, and RLT actor;
-3. an explicit constrained projection with a defensible control meaning and
-   training data generated in that projected space.
+## Rotation contract
 
-Dropping channels only at execution time is not an acceptable fourth option.
+The authoritative inference rot6d ordering is row-first:
+
+```text
+[r00, r01, r02, r10, r11, r12]
+```
+
+The LeRobot v3 bridge reorders state groups from
+`arm7 + eef9 + hand10` to Machine A's `eef9 + hand10 + arm7`. It validates the
+declared row-first convention and copies the six rotation values without a
+transpose. Source-reference and executed-action hashes include this semantic
+rotation convention; a dataset declaring any other convention must fail closed.
 
 ## Other unresolved live-runtime contracts
 
@@ -121,8 +140,12 @@ class GrootRltTeleopPolicy:
 Its constructor/configuration must require, rather than guess:
 
 - Machine-A URL and actor-service URL;
-- action, proprio, RL-token, and chunk dimensions;
-- ordered action and proprio layout hashes;
+- 26D source-reference, 19D executed-action, 26D proprio, RL-token, and chunk
+  dimensions;
+- separate ordered hashes for the 26D source reference, 19D action, and 26D
+  proprio;
+- the exact 26D-to-19D projection indices and
+  `groot_row_major_first_two_rows` rot6d convention;
 - action representation and versioned normalization-statistics file;
 - camera key mapping and task-instruction source;
 - command converter/profile name;
@@ -133,7 +156,11 @@ Its constructor/configuration must require, rather than guess:
 Before returning a chunk it must validate:
 
 - exact feature dimensions and finite values;
-- exact layout-hash equality across server, stats, and adapter;
+- exact source-reference, projected-action, and proprio hash equality across
+  server, stats, and adapter;
+- exact 26D-to-19D projection, with no arm-reference channel reaching the actor,
+  critic, replay action, fallback, or command converter;
+- row-first rot6d equality without a bridge transpose;
 - physical versus normalized action space;
 - horizon and action timestamps;
 - every action channel is consumed exactly once by the command converter;
@@ -156,29 +183,38 @@ The live capture adapter must preserve these distinctions:
 | terminal success/failure event | sparse terminal label with its label source |
 
 `source_name` alone is not enough. Store the authority state, intervention ID,
-executed command, actor proposal, VLA reference, timestamps, and layout/version
-metadata at each decision boundary.
+19D executed command, 19D actor proposal, full 26D VLA source reference, its 19D
+projected reference, timestamps, projection indices, rotation convention, and
+layout/version metadata at each decision boundary.
 
 ## Offline exporter caveat
 
 Teleop's current `RltEpisodeExporter` is useful as a schema handoff, but its
 exported RL-token tensors are empty and its VLA reference keys are unset. Such
 an export is not a ready-to-train VLA warmup replay. It must first be enriched
-with RL tokens and reference chunks from the exact frozen checkpoint, then
-validated by `groot_rlt.episode_schema` before replay construction.
+with RL tokens and complete 26D reference chunks from the exact frozen
+checkpoint; the bridge then validates and derives the 19D replay reference.
+The canonical LeRobot v3 row-first rot6d values are not transposed during this
+process. Validate the result with `groot_rlt.episode_schema` before replay
+construction.
 
 ## Acceptance gates before enabling hardware
 
-1. Unit-test observation mapping and the complete action-channel mapping.
+1. Unit-test observation mapping, row-first rot6d preservation, the complete
+   26D source layout, and the explicit 19D action projection.
 2. Run recorded-episode replay with no hardware output.
 3. Run Teleop `rollout_dry_run`; compare candidate, reference, and authority
    logs without sending commands.
 4. Run guarded simulation/digital-twin rollout with forced takeover and timeout
    tests.
-5. Verify normalization and layout hashes against captured physical actions.
+5. Verify source-reference, projected-action, proprio, and rotation-semantic
+   hashes against captured physical actions; use arm-channel sentinels to prove
+   the final seven reference values never enter the action path.
 6. Verify reset, reward, terminal label, intervention, resume, and safety-hold
    semantics.
-7. Only then add an explicit hardware-enabled launch; it must remain opt-in.
+7. Verify that no former 26D actor/critic checkpoint, snapshot, statistics file,
+   or replay journal is present in the 19D run directory.
+8. Only then add an explicit hardware-enabled launch; it must remain opt-in.
 
 Until all gates pass, the repository's existing robot/teleop launchers remain
 the only implemented interfaces and no Groot-RLT command selects them by

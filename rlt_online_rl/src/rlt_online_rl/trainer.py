@@ -20,6 +20,7 @@ from rlt_online_rl.action_representation import jax_denormalize_to_abs_chunk
 from rlt_online_rl.action_representation import resolve_delta_indices
 from rlt_online_rl.config import LearnerServiceConfig
 from rlt_online_rl.config import RLTOnlineRLConfig
+from rlt_online_rl.config import assert_action_contract_matches
 from rlt_online_rl.config import relativize_rl_config_paths
 from rlt_online_rl.networks import ChunkActor
 from rlt_online_rl.networks import PyTree
@@ -677,6 +678,11 @@ class LearnerService:
             return None
         with open(path, "rb") as f:
             payload = pickle.load(f)
+        assert_action_contract_matches(
+            payload.get("rl_config"),
+            self._rl_config,
+            context=f"learner checkpoint {path}",
+        )
         state_payload = payload["state"]
         logger.debug(
             "Restored checkpoint from %s step=%s actor_version=%s",

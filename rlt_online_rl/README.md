@@ -41,8 +41,10 @@ Machine A runs either the primary GR00T/RLT feature server or the retained
 openpi/RLT policy server. For each observation it returns:
 
 - `z_rl`: the compact RL-token feature
-- `ref_chunk`: the VLA reference action chunk
-- `proprio`: optionally supplied by GR00T for native nested state observations
+- `ref_chunk`: the VLA reference action chunk; Nero Machine A returns all 26
+  checkpoint channels
+- `proprio`: optionally supplied by GR00T for native nested state observations;
+  Nero keeps all 26 state channels
 
 Machine B runs:
 
@@ -56,7 +58,9 @@ Robot rollout:
 
 - reads ROS observations
 - queries Machine A
-- executes either the VLA reference chunk or the actor-refined chunk
+- explicitly projects Nero's validated 26D VLA reference to its 19D executable
+  EEF-and-hand reference
+- executes either the projected VLA reference chunk or the 19D actor-refined chunk
 - records raw step traces
 - builds replay transitions at episode end
 - sends transitions to the replay manager
@@ -67,19 +71,23 @@ At each chunk boundary:
 
 1. The rollout adapter reads the current robot observation.
 2. The observation is sent to Machine A.
-3. Machine A returns `z_rl`, `ref_chunk`, and optionally `proprio`.
+3. Machine A returns `z_rl`, its complete `ref_chunk`, and optionally `proprio`.
 4. The rollout uses server `proprio` for nested GR00T state, otherwise it
    derives it from the local flat observation state.
-5. During warmup or non-critical full-task prefixes, the robot executes
-   `ref_chunk` directly.
-6. During online critical-phase control, Machine B actor receives
-   `z_rl / proprio / ref_chunk` and returns a refined chunk.
-7. The robot executes the selected chunk for `chunk_exec_horizon` control ticks.
-8. The episode stores raw executed steps first.
-9. At episode end, replay windows are built and any missing Machine A anchors
+5. For Nero, Machine B validates the 26D reference dimension, source hash, and
+   rot6d convention, then explicitly projects indices `0:19`. No actor, critic,
+   replay record, fallback, or environment receives `arm_joint_target[7]`.
+6. During warmup or non-critical full-task prefixes, the robot executes the
+   projected 19D `ref_chunk`.
+7. During online critical-phase control, Machine B actor receives 2048D
+   `z_rl`, 26D `proprio`, and the 19D projected `ref_chunk`, then returns a 19D
+   refined chunk.
+8. The robot executes the selected chunk for `chunk_exec_horizon` control ticks.
+9. The episode stores raw executed steps first.
+10. At episode end, replay windows are built and any missing Machine A anchors
    are backfilled.
-10. The learner samples replay and publishes actor snapshots.
-11. The actor service hot-loads the latest snapshot.
+11. The learner samples replay and publishes actor snapshots.
+12. The actor service hot-loads the latest snapshot.
 
 ## Core Modes
 
@@ -136,13 +144,41 @@ Note that `step_trace_stride: 0` disables dense stride replay and keeps
 chunk-boundary replay. This is an intentional runtime setting for the current
 Ethernet configuration.
 
+## Nero action and rotation contract
+
+Nero intentionally uses different reference, action, and proprio dimensions:
+
+```text
+Machine A VLA reference:  eef9 + hand10 + arm7 = 26D
+Machine B action/replay:  eef9 + hand10        = 19D
+Machine B proprio:        eef9 + hand10 + arm7 = 26D
+```
+
+The 26D reference is preserved as checkpoint provenance, while an explicit
+source-hash-checked projection selects its first 19 channels before all action
+learning and execution. `action_layout_hash` identifies the 19D tensor;
+`reference_action_layout_hash` independently identifies Machine A's 26D source.
+The projection indices must contain exactly 19 unique in-range values.
+
+The authoritative inference rot6d order is the first two matrix rows:
+
+```text
+[r00, r01, r02, r10, r11, r12]
+```
+
+The LeRobot v3 bridge changes state group order from
+`arm7 + eef9 + hand10` to `eef9 + hand10 + arm7`, but it validates and copies
+rot6d without transposing it. The declared `rot6d_convention` is included in
+the semantic source and projected layout checks.
+
 ## Replay Semantics
 
 Each replay transition contains:
 
 - `z_rl`, `proprio`
-- `ref_chunk`: Machine A / VLA reference for the transition observation
-- `action_chunk`: the action actually executed on the robot
+- `ref_chunk`: the VLA reference expressed in the replay's executable action
+  space; 19D for Nero after the explicit Machine-A projection
+- `action_chunk`: the action actually executed on the robot; 19D for Nero
 - `rewards`, `done`
 - `next_z_rl`, `next_proprio`, `next_ref_chunk`
 - `source`: chunk-level control source
@@ -186,11 +222,13 @@ channels; when omitted it preserves the historical Agilex behavior and uses the
 first `min(6, action_dim)` channels. Non-contiguous indices can be supplied for
 GR00T/Nero layouts.
 
-For Nero, generate the 26D file with
-`groot-rlt export-online-stats`; do not point this field directly at GR00T's
-grouped `statistics.json` or the raw 19D LeRobot action stats. The loader honors
+For Nero, generate the versioned 19D executed-action file with
+`groot-rlt export-online-stats`. The exporter uses the real LeRobot action
+statistics for `eef9 + hand10` and does not append arm state as an action. Do not
+point this field directly at GR00T's grouped `statistics.json`. The loader honors
 the export's declared `lower_key`/`upper_key`, including symmetric `min`/`max`
-bounds, and can verify `action_layout_hash`/`proprio_layout_hash` before use.
+bounds, and verifies the 19D action layout independently from the 26D Machine-A
+reference and 26D proprio layouts.
 
 Machine-A payloads may include a flat `proprio` vector. The runtime uses it only
 for GR00T's nested observation-state layout; a legacy flat `observation["state"]`
@@ -216,6 +254,15 @@ Replay is built from raw episode traces at episode end.
 The replay journal is an append-only pickle stream. The replay manager restores
 from it on startup and continues episode numbering from the largest restored
 `episode_id + 1`.
+
+Changing Nero from the former 26D state-as-action network to the current 19D
+executed-action network changes actor and critic parameter shapes. Old 26D actor
+or critic checkpoints, actor snapshots, action statistics, and replay journals
+must not be restored into a 19D run. Use a fresh run directory. The frozen 400k
+GR00T checkpoint remains on Machine A and is unaffected by this restriction.
+The online launcher passes the configured tensor contract to the replay manager,
+which validates every restored and newly appended transition and rejects a
+journal whose action chunks are not exactly `[chunk_len, 19]`.
 
 ## Human Control And Manual Signals
 
@@ -263,6 +310,10 @@ python -m pip install -e '.[monitor]'
 Start the Machine B services with an explicit task config. For GR00T/Nero,
 first replace every `REPLACE_*` value in the example; it is designed to fail
 before training when statistics/layout metadata are still missing:
+
+The example config uses `action_dim: 19`, `proprio_dim: 26`, an exact 26D
+Machine-A reference contract, and an explicit `0:19` projection. Its artifact
+paths point at a separate 19D run so a former 26D actor/critic cannot be loaded.
 
 ```bash
 cd "$RLT_ROOT/rlt_online_rl"
@@ -316,9 +367,10 @@ python launch/fake_machine_a.py
 ```
 
 The existing robot rollout below is the legacy 7D Pika/Agilex ROS adapter. It
-must not be used with the 26D GR00T template. GR00T rollout instead requires an
-explicit target-specific `env_factory`; that interface is intentionally left
-unselected until the robot/Teleop action contract is validated.
+must not be used with Nero's 19D executed-action template or its 26D Machine-A
+reference. GR00T rollout instead requires an explicit target-specific
+`env_factory`; that interface is intentionally left unselected until the
+robot/Teleop action contract is validated.
 
 Legacy robot rollout:
 

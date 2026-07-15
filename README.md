@@ -32,10 +32,21 @@ configured and checked for the target system first.
 flowchart LR
     C[Fine-tuned GR00T checkpoint] --> A[Machine A: GR00T + RL-token server]
     O[Robot / teleop observation] --> A
-    A -->|z_rl, physical ref_chunk, proprio| B[Machine B: actor, critic, replay]
-    B -->|physical action chunk| R[Robot adapter and safety authority]
+    A -->|z_rl, 26D physical ref_chunk, 26D proprio| B[Machine B: explicit 26D-to-19D projection, actor, critic, replay]
+    B -->|19D physical EEF-and-hand action chunk| R[Robot adapter and safety authority]
     R -->|episode, reward, intervention provenance| B
 ```
+
+The current inference rotation contract is authoritative: every EEF rot6d uses
+the first two rotation-matrix rows in this order:
+
+```text
+[r00, r01, r02, r10, r11, r12]
+```
+
+The LeRobot v3 data bridge validates this convention and reorders state groups
+from `arm7 + eef9 + hand10` to Machine A's `eef9 + hand10 + arm7` input. It does
+not transpose or otherwise reinterpret the six rotation values.
 
 There are two deliberately separate Python 3.10 packages:
 
@@ -106,7 +117,7 @@ available as `evaluate-token`, `precompute`, and `visualize-token`.
 
 ### 2. Export online-action normalization statistics
 
-For the currently supported Nero state-as-action dataset layout:
+For Nero's real executed `eef_9d[9] + hand_joint_target[10]` action layout:
 
 ```bash
 groot-rlt export-online-stats \
@@ -115,9 +126,10 @@ groot-rlt export-online-stats \
   --output <groot-online-action-stats.json>
 ```
 
-The export records the ordered action channels and their layout hash. Do not
-substitute GR00T's grouped `statistics.json` or rename absolute-action stats as
-delta-action stats.
+The export records exactly 19 executed-action channels and their semantic layout
+hash. It does not append the checkpoint-only seven arm-joint reference channels.
+Do not substitute GR00T's grouped `statistics.json` or rename absolute-action
+stats as delta-action stats.
 
 ### 3. Serve the frozen GR00T reference and RL token
 
@@ -142,9 +154,14 @@ The WebSocket response is:
 
 ```text
 z_rl      float32 [z_dim]
-ref_chunk float32 [chunk_len, action_dim]  # processor-decoded physical space
-proprio   float32 [proprio_dim]
+ref_chunk float32 [chunk_len, 26]  # complete processor-decoded VLA reference
+proprio   float32 [26]
 ```
+
+Machine A intentionally preserves the frozen 400k checkpoint's complete 26D
+reference. Machine B validates its dimension, layout hash, and row-first rot6d
+metadata, then projects indices `0:19` before the reference reaches the actor,
+critic, replay, normalization adapter, fallback policy, or robot environment.
 
 The server accepts native nested GR00T observations and the legacy flat
 `{images, state, prompt}` request. Camera and non-default state layouts can be
@@ -166,10 +183,16 @@ python -m pip install -e ../packages/openpi-client
 python -m pip install -e '.[dev]'
 ```
 
-A fail-closed 26D starting template is provided at
+A fail-closed Nero template with a 19D actor/critic action, a 26D Machine-A
+reference, and 26D proprio is provided at
 [`rlt_online_rl/configs/tasks/groot_nero/online_rl.example.yaml`](rlt_online_rl/configs/tasks/groot_nero/online_rl.example.yaml).
 It intentionally contains replacement paths/hashes and is not a ready-to-run
 robot configuration.
+
+The 19D network tensor contract changes actor inputs/outputs and critic inputs.
+Do not reuse actor/critic checkpoints, actor snapshots, or replay journals from
+the former 26D RLT configuration; start a separate 19D artifact directory. This
+restriction does not apply to the frozen 400k GR00T checkpoint on Machine A.
 
 After replacing those values and implementing a target-specific environment
 factory, Machine B can be started with:
@@ -181,8 +204,8 @@ python scripts/run_online_rl.py \
 ```
 
 `env_factory` is deliberately explicit. No unverified robot adapter is selected
-by default, so this command cannot silently send a 26D action through the old
-7D Pika/Agilex ROS bridge.
+by default, so this command cannot silently send either the 26D VLA reference or
+the 19D Nero action through the old 7D Pika/Agilex ROS bridge.
 
 ## Teleoperation boundary
 
@@ -191,12 +214,13 @@ authority, RTC, and hardware output. Its correct future integration point is
 the high-level `PolicyInterface`, not its CAN/robot drivers and not the existing
 Pika ROS topics.
 
-The current contracts are not yet action-equivalent: the RLT side uses a full
-26D ordered vector, while the current Teleop conversion to
-`SingleArmTeleopCommand` does not consume every one of those channels. A direct
-adapter could therefore train or execute in a different action space than the
-one advertised by the normalization/layout hash. The existing robot and teleop
-interfaces are left unchanged until that projection is explicitly resolved.
+The action-space split is now explicit. Machine A retains the GR00T checkpoint's
+full `eef9 + hand10 + arm7 = 26D` reference for provenance. Machine B uses only
+the actually executable `eef9 + hand10 = 19D` projection for actor/critic input,
+actor output, replay, normalization, fallback, and the future Teleop command.
+The seven `arm_joint_target` values never enter an action network or hardware
+command. Source and projected layouts have separate hashes, so this projection
+cannot occur silently or only at execution time.
 
 The verified mapping, provenance requirements, and acceptance gates are in
 [`docs/groot_teleop_integration.md`](docs/groot_teleop_integration.md).

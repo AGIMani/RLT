@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
@@ -16,6 +17,7 @@ from rlt_online_rl.replay import COLLECTION_PHASE_WARMUP
 from rlt_online_rl.replay import EpisodeStepRecord
 from rlt_online_rl.replay import ReplayBuffer
 from rlt_online_rl.replay import ReplayManager
+from rlt_online_rl.replay import ReplayTensorContract
 from rlt_online_rl.replay import TransitionSource
 from rlt_online_rl.replay import build_chunk_transitions_from_episode
 from rlt_online_rl.replay import build_terminal_aligned_chunk_transition
@@ -161,6 +163,47 @@ def test_replay_manager_journal_roundtrip(tmp_path) -> None:
     restored = ReplayManager(32, journal_path=str(journal_path), seed=0)
     assert restored.stats()["size"] == len(transitions)
     assert restored.stats()["max_episode_id"] == 7
+
+
+def test_replay_manager_rejects_journal_from_different_action_contract(tmp_path) -> None:
+    journal_path = tmp_path / "replay.pkl"
+    old_contract = ReplayTensorContract(z_dim=4, proprio_dim=3, chunk_len=3, action_dim=2)
+    manager = ReplayManager(
+        32,
+        journal_path=str(journal_path),
+        seed=0,
+        tensor_contract=old_contract,
+    )
+    manager.add_transitions(build_chunk_transitions_from_episode(_make_episode(), chunk_len=3, stride=2))
+
+    current_contract = ReplayTensorContract(
+        z_dim=4,
+        proprio_dim=3,
+        chunk_len=3,
+        action_dim=3,
+    )
+    with pytest.raises(ValueError, match="replay journal.*ref_chunk has shape"):
+        ReplayManager(
+            32,
+            journal_path=str(journal_path),
+            seed=0,
+            tensor_contract=current_contract,
+        )
+
+
+def test_replay_manager_rejects_new_transition_with_wrong_action_dim(tmp_path) -> None:
+    contract = ReplayTensorContract(z_dim=4, proprio_dim=3, chunk_len=3, action_dim=2)
+    manager = ReplayManager(
+        32,
+        journal_path=str(tmp_path / "replay.pkl"),
+        seed=0,
+        tensor_contract=contract,
+    )
+    transition = build_chunk_transitions_from_episode(_make_episode(), chunk_len=3, stride=2)[0]
+    transition.action_chunk = np.zeros((3, 3), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="action_chunk has shape"):
+        manager.add_transition(transition)
 
 
 def test_replay_manager_batch_extend_fsyncs_once(tmp_path, monkeypatch) -> None:
