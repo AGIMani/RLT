@@ -176,6 +176,8 @@ def test_nero_pinned_payload_uses_19d_proprio_and_separate_26d_reference_project
         rot6d_convention=rot6d_convention,
     )
     full_reference = np.arange(52, dtype=np.float32).reshape(2, 26)
+    row_first_rot6d = np.asarray([100.0, 101.0, 102.0, 110.0, 111.0, 112.0])
+    full_reference[:, 3:9] = row_first_rot6d
     payload_proprio = np.arange(100, 119, dtype=np.float32)
     payload = {
         "z_rl": np.zeros((4,), dtype=np.float32),
@@ -197,6 +199,10 @@ def test_nero_pinned_payload_uses_19d_proprio_and_separate_26d_reference_project
     assert np.array_equal(normalized["proprio"], payload_proprio)
     assert not np.array_equal(normalized["proprio"], np.arange(19, dtype=np.float32))
     assert np.array_equal(normalized["ref_chunk"], full_reference[:, :19])
+    assert np.array_equal(
+        normalized["ref_chunk"][:, 3:9],
+        np.repeat(row_first_rot6d[None, :], 2, axis=0),
+    )
     assert np.array_equal(normalized["source_ref_chunk"], full_reference)
 
 
@@ -221,6 +227,43 @@ def test_nero_pinned_payload_rejects_layout_names_that_do_not_match_hash() -> No
     with pytest.raises(ValueError, match="proprio layout hash"):
         normalize_feature_payload(
             payload,
+            cfg,
+            observation={"state": np.arange(26, dtype=np.float32)},
+        )
+
+
+def test_nero_pinned_payload_rejects_26d_proprio_and_wrong_advertised_hash() -> None:
+    layout = [f"state[{index}]" for index in range(19)]
+    expected_hash = _layout_hash(layout, None)
+    cfg = RLTOnlineRLConfig(
+        action_dim=19,
+        proprio_dim=19,
+        chunk_len=2,
+        z_dim=4,
+        proprio_layout_hash=expected_hash,
+    )
+    base_payload = {
+        "z_rl": np.zeros((4,), dtype=np.float32),
+        "ref_chunk": np.zeros((2, 19), dtype=np.float32),
+        "proprio": np.zeros((19,), dtype=np.float32),
+        "proprio_layout_hash": expected_hash,
+        "proprio_layout": layout,
+    }
+
+    wrong_shape = dict(base_payload)
+    wrong_shape["proprio"] = np.zeros((26,), dtype=np.float32)
+    with pytest.raises(ValueError, match="proprio expected dim 19"):
+        normalize_feature_payload(
+            wrong_shape,
+            cfg,
+            observation={"state": np.arange(26, dtype=np.float32)},
+        )
+
+    wrong_hash = dict(base_payload)
+    wrong_hash["proprio_layout_hash"] = "sha256:wrong"
+    with pytest.raises(ValueError, match="proprio_layout_hash"):
+        normalize_feature_payload(
+            wrong_hash,
             cfg,
             observation={"state": np.arange(26, dtype=np.float32)},
         )

@@ -1390,6 +1390,8 @@ class EnvDriver:
                 else np.asarray(start_features.ref_chunk, dtype=np.float32),
             )
         )
+        if start_features is not None:
+            self._record_feature_anchor(raw_episode, observation_idx, start_features)
         for local_offset, anchor_features in zip(policy_anchor_offsets, policy_anchor_features):
             absolute_start = step_start + int(local_offset)
             if step_start <= absolute_start < len(raw_episode.steps):
@@ -1832,4 +1834,6 @@ class EnvDriver:
                 break
         if next_obs is None:
             raise RuntimeError("Environment did not produce a next observation.")
-        return next_obs, rewards, done, dict(info)
+        info = dict(info)
+        info["chunk_start_features"] = plan.start_features
+        return next_obs, rewards, done, info

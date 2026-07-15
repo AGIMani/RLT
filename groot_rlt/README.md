@@ -137,7 +137,7 @@ groot-rlt serve-features \
   --z-dim 2048 \
   --chunk-len 10 \
   --action-dim 26 \
-  --proprio-dim 26 \
+  --proprio-dim 19 \
   --denoise-steps 32 \
   --host 0.0.0.0 \
   --port 8000
@@ -150,7 +150,7 @@ The WebSocket protocol is compatible with
 request observation
   -> z_rl      float32 [2048]
   -> ref_chunk float32 [chunk_len, 26]
-  -> proprio   float32 [26]
+  -> proprio   float32 [19]
 ```
 
 `/healthz` is provided for readiness checks. The current GR00T backend reports
@@ -183,7 +183,9 @@ eef_9d[9] + hand_joint_target[10] + arm_joint_target[7] = 26D
 This is a VLA reference and audit record, not the hardware command space. The
 Machine-B boundary validates the 26D source layout and explicitly selects the
 first 19 channels before actor/critic, replay, normalization, fallback, or
-execution. Proprio remains the complete 26D `eef9 + hand10 + arm7` state.
+execution. Independently, the frozen 400k model receives the complete 26D
+`eef9 + hand10 + arm7` checkpoint state internally, while Machine A exposes
+only `eef9 + hand10 = 19D` as actor/critic proprioception.
 
 The authoritative inference rot6d convention is row-first:
 
@@ -202,18 +204,19 @@ intentionally stateless and does not apply RTC. RTC/history stitching belongs
 on the execution side: making feature extraction stateful would corrupt replay
 feature reconstruction when observations are requested out of order.
 
-## Nero 26D reference / 19D executed-action configuration
+## Nero 26D checkpoint/reference and 19D actor configuration
 
-The online runtime accepts server-provided 26D `proprio`, which allows nested
-GR00T observations instead of requiring the old flat `observation["state"]`.
-The actor, critic, replay action, normalization statistics, and executable
-fallback use only the real 19D EEF-and-hand command:
+Machine A keeps the frozen 400k model's full 26D state input and full 26D VLA
+reference private to the checkpoint/audit path. Its signed wire payload exposes
+an explicit 19D `eef9 + hand10` proprio vector. The actor, critic, replay
+proprio/action/reference tensors, normalization statistics, and executable
+fallback are all 19D:
 
 ```yaml
 experiment:
   rl:
     action_dim: 19
-    proprio_dim: 26
+    proprio_dim: 19
     z_dim: 2048
     chunk_len: 10
     action_representation: abs

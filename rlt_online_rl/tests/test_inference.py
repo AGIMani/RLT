@@ -20,7 +20,9 @@ from rlt_online_rl.config import RLTOnlineRLConfig
 from rlt_online_rl.inference import ActorClient
 from rlt_online_rl.inference import ActorRequest
 from rlt_online_rl.inference import ActorService
+from rlt_online_rl.inference import ChunkFeatures
 from rlt_online_rl.inference import EnvDriver
+from rlt_online_rl.inference import PolicyPlan
 from rlt_online_rl.inference import RLTPolicyInferenceWrapper
 from rlt_online_rl.inference import _semantic_layout_hash
 from rlt_online_rl.inference import maybe_refine_chunk
@@ -30,6 +32,7 @@ from rlt_online_rl.replay import RawEpisodeChunk
 from rlt_online_rl.replay import RawEpisodeStep
 from rlt_online_rl.replay import RawEpisodeTrace
 from rlt_online_rl.replay import TransitionSource
+from rlt_online_rl.replay import save_raw_episode
 
 
 def _config() -> RLTOnlineRLConfig:
@@ -245,6 +248,16 @@ def test_actor_service_rejects_snapshot_from_different_action_contract(tmp_path)
         ActorService(cfg, ActorServiceConfig(snapshot_path=str(snapshot_path)))
 
 
+def test_actor_service_rejects_old_nero_26d_proprio_snapshot(tmp_path) -> None:
+    current_cfg = dataclasses.replace(_config(), action_dim=19, proprio_dim=19)
+    old_cfg = dataclasses.replace(current_cfg, proprio_dim=26)
+    snapshot_path = tmp_path / "old-nero-actor.pkl"
+    _write_snapshot(str(snapshot_path), 1, old_cfg, seed=0)
+
+    with np.testing.assert_raises_regex(ValueError, "proprio_dim"):
+        ActorService(current_cfg, ActorServiceConfig(snapshot_path=str(snapshot_path)))
+
+
 def test_inference_default_uses_actor_mean_without_dropout(tmp_path) -> None:
     cfg = _config()
     snapshot_path = tmp_path / "actor.pkl"
@@ -421,6 +434,110 @@ def test_trace_records_keep_actor_version_for_raw_episode() -> None:
 
     assert records[0].actor_param_version == 12
     assert raw_episode.steps[0].actor_param_version == 12
+
+
+def test_generic_chunk_start_preserves_full_reference_in_raw_pickle(tmp_path) -> None:
+    cfg = dataclasses.replace(
+        _replay_config(),
+        action_dim=19,
+        proprio_dim=19,
+        reference_action_dim=26,
+        reference_action_layout_hash="sha256:source",
+        reference_action_indices=tuple(range(19)),
+        action_layout_hash="sha256:target",
+    )
+    projected_reference = np.arange(cfg.chunk_len * 19, dtype=np.float32).reshape(
+        cfg.chunk_len,
+        19,
+    )
+    full_reference = np.concatenate(
+        (
+            projected_reference,
+            np.full((cfg.chunk_len, 7), 999.0, dtype=np.float32),
+        ),
+        axis=-1,
+    )
+    start_features = ChunkFeatures(
+        z_rl=np.arange(cfg.z_dim, dtype=np.float32),
+        proprio=np.arange(19, dtype=np.float32),
+        ref_chunk=projected_reference,
+        source_ref_chunk=full_reference,
+    )
+
+    class _OneStepEnv:
+        def step(self, _action):
+            return {"state": np.ones((19,), dtype=np.float32)}, 0.0, True, False, {}
+
+    driver = EnvDriver(
+        env=_OneStepEnv(),
+        feature_provider=object(),
+        actor_client=object(),
+        replay_client=object(),
+        rl_config=cfg,
+        env_config=EnvDriverConfig(chunk_exec_horizon=1),
+    )
+    initial_observation = {"state": np.zeros((19,), dtype=np.float32)}
+
+    def planner(_observation, _local_step):
+        return PolicyPlan(
+            action_chunk=np.zeros((cfg.chunk_len, 19), dtype=np.float32),
+            ref_chunk=start_features.ref_chunk,
+            source=int(TransitionSource.BASE),
+            start_features=start_features,
+        )
+
+    next_observation, _, done, info = driver._execute_chunk(initial_observation, planner)
+    assert done
+    assert info["chunk_start_features"] is start_features
+    records = driver._build_trace_records(
+        [
+            {
+                "observation": initial_observation,
+                "next_observation": next_observation,
+                "action": np.zeros((19,), dtype=np.float32),
+                "ref_action": np.zeros((19,), dtype=np.float32),
+                "reward": 0.0,
+                "source": int(TransitionSource.BASE),
+                "human_controlled": False,
+                "done": True,
+            }
+        ],
+        episode_id=8,
+        start_env_step_id=0,
+        chunk_success=0,
+        collection_phase="warmup",
+    )
+    raw_episode = RawEpisodeTrace(
+        episode_id=8,
+        chunk_len=cfg.chunk_len,
+        observations=[initial_observation],
+        steps=[],
+        chunks=[],
+    )
+    driver._append_raw_chunk(
+        raw_episode,
+        observation_idx=0,
+        trace_records=records,
+        chunk_step_id=0,
+        chunk_source=int(TransitionSource.BASE),
+        collection_phase="warmup",
+        done=True,
+        success=0,
+        drop_transition=False,
+        start_features=info["chunk_start_features"],
+        policy_anchor_offsets=[],
+        policy_anchor_features=[],
+    )
+
+    raw_path = tmp_path / "episode.pkl"
+    save_raw_episode(raw_episode, str(raw_path))
+    with raw_path.open("rb") as stream:
+        restored = pickle.load(stream)
+    anchor = restored.summary["feature_anchors"][0]
+    assert anchor["proprio"].shape == (19,)
+    assert anchor["ref_chunk"].shape == (cfg.chunk_len, 19)
+    assert anchor["source_ref_chunk"].shape == (cfg.chunk_len, 26)
+    np.testing.assert_array_equal(anchor["source_ref_chunk"], start_features.source_ref_chunk)
 
 
 def test_rollout_trace_summary_counts_sources_and_actor_versions() -> None:

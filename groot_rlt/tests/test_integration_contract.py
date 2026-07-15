@@ -29,7 +29,7 @@ class _FakeBackend:
         }
 
 
-def test_machine_a_contract_supports_nero_26d_single_and_batch() -> None:
+def test_machine_a_contract_retains_generic_26d_compatibility() -> None:
     policy = MachineAFeaturePolicy(
         _FakeBackend(), FeatureContract(z_dim=2048, chunk_len=10, action_dim=26, proprio_dim=26)
     )
@@ -66,11 +66,12 @@ def test_machine_a_rejects_serial_pseudo_batch_when_not_advertised() -> None:
         policy.infer({"batch": [{"offset": 1}, {"offset": 2}]})
 
 
-def test_nero_flat_observation_adapter_preserves_eef_hand_arm_order() -> None:
+def test_nero_full_state_reaches_vla_while_actor_proprio_is_19d() -> None:
     backend = object.__new__(GrootN1d7FeatureBackend)
     backend.contract = FeatureContract()
     backend.image_key_map = {"head": "ego_view", "wrist": "wrist_view"}
     backend.flat_state_layout = None
+    backend.proprio_keys = ("eef_9d", "hand_joint_pos")
     backend.default_instruction = "pick and place"
     backend.policy = SimpleNamespace(
         language_key="annotation.human.action.task_description",
@@ -95,6 +96,15 @@ def test_nero_flat_observation_adapter_preserves_eef_hand_arm_order() -> None:
     assert np.array_equal(adapted["state"]["hand_joint_pos"].reshape(-1), state[9:19])
     assert np.array_equal(adapted["state"]["arm_joint_pos"].reshape(-1), state[19:26])
     assert adapted["language"]["annotation.human.action.task_description"] == [["pick and place"]]
+    actor_proprio = backend._extract_proprio(
+        {
+            "eef_9d": state[:9],
+            "hand_joint_pos": state[9:19],
+            "arm_joint_pos": state[19:26],
+        }
+    )
+    assert actor_proprio.shape == (19,)
+    assert np.array_equal(actor_proprio, state[:19])
 
 
 def test_channel_layout_hash_is_order_sensitive() -> None:

@@ -329,6 +329,52 @@ class LeRobotV3ReplayBridgeTest(unittest.TestCase):
         self.assertEqual(terminal.success, 0)
         self.assertEqual(bundle.outcome_counts, {"success": 0, "failure": 1})
 
+    def test_v2_fingerprint_covers_full_26d_reference_tail(self) -> None:
+        rows = _rows(["policy_rollout", "policy_rollout"])
+
+        def provider_with_arm_tail(tail_value: float):
+            def provider(identity, row):
+                del identity
+                frame_index = int(np.asarray(row["frame_index"]).item())
+                full_reference = np.concatenate(
+                    (
+                        _action(frame_index),
+                        np.full((7,), tail_value, dtype=np.float32),
+                    )
+                )
+                return ReplayFrameFeatures(
+                    z_rl=np.arange(4, dtype=np.float32) + frame_index,
+                    vla_reference_action=full_reference,
+                )
+
+            return provider
+
+        first = build_lerobot_v3_replay_bundle(
+            rows,
+            info_payload=_info(total_frames=2),
+            recap_payload=_recap(episode_lengths=[2]),
+            feature_provider=provider_with_arm_tail(1.0),
+            feature_contract_fingerprint=_FEATURE_FINGERPRINT,
+        )
+        second = build_lerobot_v3_replay_bundle(
+            rows,
+            info_payload=_info(total_frames=2),
+            recap_payload=_recap(episode_lengths=[2]),
+            feature_provider=provider_with_arm_tail(2.0),
+            feature_contract_fingerprint=_FEATURE_FINGERPRINT,
+        )
+
+        first_step = first.segments[0].steps[0]
+        second_step = second.segments[0].steps[0]
+        np.testing.assert_array_equal(first_step.ref_action, second_step.ref_action)
+        self.assertFalse(
+            np.array_equal(
+                first_step.vla_reference_action,
+                second_step.vla_reference_action,
+            )
+        )
+        self.assertNotEqual(first.bridge_fingerprint, second.bridge_fingerprint)
+
     def test_intervention_must_match_both_mirror_and_partition(self) -> None:
         base_rows = _rows(["policy_rollout", "human_correction"])
         mutations = (

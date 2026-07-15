@@ -44,7 +44,8 @@ openpi/RLT policy server. For each observation it returns:
 - `ref_chunk`: the VLA reference action chunk; Nero Machine A returns all 26
   checkpoint channels
 - `proprio`: optionally supplied by GR00T for native nested state observations;
-  Nero keeps all 26 state channels
+  pinned Nero deployments return exactly `eef9 + hand10 = 19D`, while the
+  frozen 400k VLA still receives its complete 26D state internally on Machine A
 
 Machine B runs:
 
@@ -71,16 +72,18 @@ At each chunk boundary:
 
 1. The rollout adapter reads the current robot observation.
 2. The observation is sent to Machine A.
-3. Machine A returns `z_rl`, its complete `ref_chunk`, and optionally `proprio`.
-4. The rollout uses server `proprio` for nested GR00T state, otherwise it
-   derives it from the local flat observation state.
+3. Machine A returns `z_rl`, its complete 26D `ref_chunk`, and an explicit 19D
+   Nero `proprio` vector.
+4. A pinned Nero rollout validates and uses that 19D payload; it never slices
+   the raw 26D observation implicitly. Unpinned generic legacy flat layouts may
+   still derive proprio from local `observation["state"]`.
 5. For Nero, Machine B validates the 26D reference dimension, source hash, and
    rot6d convention, then explicitly projects indices `0:19`. No actor, critic,
    replay record, fallback, or environment receives `arm_joint_target[7]`.
 6. During warmup or non-critical full-task prefixes, the robot executes the
    projected 19D `ref_chunk`.
 7. During online critical-phase control, Machine B actor receives 2048D
-   `z_rl`, 26D `proprio`, and the 19D projected `ref_chunk`, then returns a 19D
+   `z_rl`, 19D `proprio`, and the 19D projected `ref_chunk`, then returns a 19D
    refined chunk.
 8. The robot executes the selected chunk for `chunk_exec_horizon` control ticks.
 9. The episode stores raw executed steps first.
@@ -151,7 +154,8 @@ Nero intentionally uses different reference, action, and proprio dimensions:
 ```text
 Machine A VLA reference:  eef9 + hand10 + arm7 = 26D
 Machine B action/replay:  eef9 + hand10        = 19D
-Machine B proprio:        eef9 + hand10 + arm7 = 26D
+Machine B proprio:        eef9 + hand10        = 19D
+400k VLA input state:     eef9 + hand10 + arm7 = 26D (Machine A internal)
 ```
 
 The 26D reference is preserved as checkpoint provenance, while an explicit
@@ -228,11 +232,13 @@ statistics for `eef9 + hand10` and does not append arm state as an action. Do no
 point this field directly at GR00T's grouped `statistics.json`. The loader honors
 the export's declared `lower_key`/`upper_key`, including symmetric `min`/`max`
 bounds, and verifies the 19D action layout independently from the 26D Machine-A
-reference and 26D proprio layouts.
+reference and 19D actor/critic proprio layouts.
 
-Machine-A payloads may include a flat `proprio` vector. The runtime uses it only
-for GR00T's nested observation-state layout; a legacy flat `observation["state"]`
-remains authoritative even when the payload also contains `proprio`.
+Pinned Machine-A payloads must include an explicit `proprio` vector plus its
+ordered layout and semantic hash. Nero requires exactly 19D `eef9 + hand10` and
+rejects missing/26D/mismatched payloads even when the raw observation is 26D.
+Only an unpinned generic legacy flat contract retains the historical local-state
+fallback.
 
 ## Replay Windows
 
@@ -311,7 +317,7 @@ Start the Machine B services with an explicit task config. For GR00T/Nero,
 first replace every `REPLACE_*` value in the example; it is designed to fail
 before training when statistics/layout metadata are still missing:
 
-The example config uses `action_dim: 19`, `proprio_dim: 26`, an exact 26D
+The example config uses `action_dim: 19`, `proprio_dim: 19`, an exact 26D
 Machine-A reference contract, and an explicit `0:19` projection. Its artifact
 paths point at a separate 19D run so a former 26D actor/critic cannot be loaded.
 
@@ -333,7 +339,7 @@ cd /home/whf/Project/Isaac-GR00T
   --vlm-model-path <Cosmos-Reason2-2B> \
   --rl-token-checkpoint <rl-token-checkpoint.pt> \
   --action-dim 26 \
-  --proprio-dim 26 \
+  --proprio-dim 19 \
   --chunk-len 10 \
   --denoise-steps 32 \
   --port 8000

@@ -11,6 +11,7 @@ SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from rlt_online_rl.config import RLTOnlineRLConfig
 import rlt_online_rl.replay as replay_module
 from rlt_online_rl.replay import COLLECTION_PHASE_ONLINE
 from rlt_online_rl.replay import COLLECTION_PHASE_WARMUP
@@ -22,6 +23,7 @@ from rlt_online_rl.replay import RLTTransition
 from rlt_online_rl.replay import TransitionSource
 from rlt_online_rl.replay import build_chunk_transitions_from_episode
 from rlt_online_rl.replay import build_terminal_aligned_chunk_transition
+from rlt_online_rl.trainer import prepare_replay_training_batch
 
 
 def _make_episode(
@@ -279,10 +281,12 @@ def test_replay_manager_rejects_new_transition_with_wrong_action_dim(tmp_path) -
 def test_nero_replay_contract_requires_finite_float32_19d_actions(tmp_path) -> None:
     steps = _make_episode()
     for step in steps:
+        step.proprio = np.full((19,), step.step_id + 0.25, dtype=np.float32)
+        step.next_proprio = np.full((19,), step.step_id + 1.25, dtype=np.float32)
         step.action = np.full((19,), step.step_id + 1, dtype=np.float16)
         step.ref_action = np.full((19,), step.step_id + 0.5, dtype=np.float16)
     transition = build_chunk_transitions_from_episode(steps, chunk_len=3, stride=3)[0]
-    contract = ReplayTensorContract(z_dim=4, proprio_dim=3, chunk_len=3, action_dim=19)
+    contract = ReplayTensorContract(z_dim=4, proprio_dim=19, chunk_len=3, action_dim=19)
     manager = ReplayManager(
         32,
         journal_path=str(tmp_path / "replay.pkl"),
@@ -292,8 +296,27 @@ def test_nero_replay_contract_requires_finite_float32_19d_actions(tmp_path) -> N
     manager.add_transition(transition)
     batch = manager.sample_batch(1)
     assert batch["action_chunk"].shape == (1, 3, 19)
+    assert batch["ref_chunk"].shape == (1, 3, 19)
+    assert batch["proprio"].shape == (1, 19)
+    assert batch["next_proprio"].shape == (1, 19)
     assert batch["action_chunk"].dtype == np.float32
     assert batch["ref_chunk"].dtype == np.float32
+    assert "source_ref_chunk" not in batch
+    assert "vla_reference_action" not in batch
+    learner_batch = prepare_replay_training_batch(
+        batch,
+        RLTOnlineRLConfig(
+            action_dim=19,
+            chunk_len=3,
+            z_dim=4,
+            proprio_dim=19,
+        ),
+    )
+    assert learner_batch["proprio"].shape == (1, 19)
+    assert learner_batch["action_chunk"].shape == (1, 3, 19)
+    assert learner_batch["ref_chunk"].shape == (1, 3, 19)
+    assert "source_ref_chunk" not in learner_batch
+    assert "vla_reference_action" not in learner_batch
 
     bad = transition.to_journal_record()
     bad["action_chunk"] = bad["action_chunk"].copy()
